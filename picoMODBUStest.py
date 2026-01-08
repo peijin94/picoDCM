@@ -95,20 +95,34 @@ MODBUS_CRC_LSB = bytes([
 ])
 
 
+def crc16_modbus(data: bytes) -> int:
+    """
+    Calculate MODBUS CRC16 using standard polynomial 0xA001.
+    Returns CRC16 value. CRC is appended LSB first, then MSB on the wire.
+    """
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+
+def check_crc(frame: bytes) -> bool:
+    """Check if frame has valid CRC"""
+    if len(frame) < 4:
+        return False
+    rx_crc = frame[-2] | (frame[-1] << 8)  # LSB then MSB on the wire
+    calc_crc = crc16_modbus(frame[:-2])
+    return rx_crc == calc_crc
+
+
 def crc16(data: bytes) -> int:
-    """
-    Calculate MODBUS CRC16 using lookup tables (matches Rabbit C implementation).
-    From low_level_modbus_slave.lib.c MODBUS_CRC()
-    """
-    c_hi = 0xFF  # CRC MSB accumulator
-    c_lo = 0xFF  # CRC LSB accumulator
-    
-    for byte in data:
-        w = c_hi ^ byte  # Next table index
-        c_hi = c_lo ^ MODBUS_CRC_MSB[w]  # Next CRC MSB
-        c_lo = MODBUS_CRC_LSB[w]  # Next CRC LSB
-    
-    return (c_hi << 8) | c_lo
+    """Alias for crc16_modbus for backward compatibility"""
+    return crc16_modbus(data)
 
 
 # MODBUS function code names
@@ -181,340 +195,258 @@ def parse_modbus_message(data):
     return info
 
 
-def print_modbus_message(msg_info, crc_valid=True, raw_bytes=None):
-    """Print formatted MODBUS message information"""
-    print("-" * 60)
-    print(f"MODBUS Message (CRC: {'VALID' if crc_valid else 'INVALID'}):")
-    print(f"  Address:      {msg_info['address']} (0x{msg_info['address']:02X})")
-    print(f"  Function:     0x{msg_info['function']:02X} - {msg_info['function_name']}")
+def decode_modbus_message(frame: bytes) -> (int, str):
+    """
+    Decode MODBUS frame to formatted string (matching picoDCMdecoder.py format).
+    Returns: (addr, formatted_string) where formatted_string is:
+    addr=XX | func=0xXXXX | funcName=NAME | payload=...
+    """
+    if len(frame) < 4:
+        return 0, f"INVALID (too short: {len(frame)} bytes)"
     
-    # Print specific parameters
-    if 'start_address' in msg_info:
-        print(f"  Start Addr:   {msg_info['start_address']} (0x{msg_info['start_address']:04X})")
-        print(f"  Quantity:     {msg_info['quantity']} (0x{msg_info['quantity']:04X})")
+    addr = frame[0]
+    func = frame[1]
+    payload = frame[2:-2]
     
-    if 'register_address' in msg_info:
-        print(f"  Reg Address:  {msg_info['register_address']} (0x{msg_info['register_address']:04X})")
+    # Exception response
+    if func & 0x80 and len(payload) >= 1:
+        exc = payload[0]
+        return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=EXCEPTION | payload=0x{exc:02X}"
     
-    if 'value' in msg_info:
-        print(f"  Value:        {msg_info['value']} (0x{msg_info['value']:04X})")
+    # 0x06 Write Single Register
+    if func == 0x06 and len(payload) == 4:
+        reg = (payload[0] << 8) | payload[1]
+        val = (payload[2] << 8) | payload[3]
+        
+        if reg == 0x0000:
+            atn1 = (val >> 8) & 0xFF
+            atn2 = val & 0xFF
+            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} ATN1={atn1}dB ATN2={atn2}dB"
+        
+        return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} val=0x{val:04X}"
     
-    if 'and_mask' in msg_info:
-        print(f"  AND Mask:     0x{msg_info['and_mask']:04X}")
-        print(f"  OR Mask:      0x{msg_info['or_mask']:04X}")
+    # 0x03/0x04 Read regs request
+    if func in (0x03, 0x04) and len(payload) == 4:
+        start = (payload[0] << 8) | payload[1]
+        qty = (payload[2] << 8) | payload[3]
+        func_name = "RDH" if func == 0x03 else "RDI"
+        return addr, f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload=start=0x{start:04X} qty={qty}"
     
-    # Print raw bytes (including CRC if available)
-    if raw_bytes:
-        print(f"  Raw Bytes:    ", end="")
-        for i, b in enumerate(raw_bytes):
-            if i > 0 and i % 16 == 0:
-                print(f"\n                 ", end="")
-            print(f"{b:02X} ", end="")
-        print()
+    # 0x03/0x04 Read regs response: bytecount + data
+    if func in (0x03, 0x04) and len(payload) >= 1:
+        bc = payload[0]
+        data = payload[1:]
+        if bc == len(data) and (bc % 2 == 0):
+            regs = []
+            for k in range(0, bc, 2):
+                regs.append((data[k] << 8) | data[k + 1])
+            func_name = "RDH_RESP" if func == 0x03 else "RDI_RESP"
+            regs_str = " ".join(f"0x{r:04X}" for r in regs)
+            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload={regs_str}"
+        func_name = "RDH_RESP" if func == 0x03 else "RDI_RESP"
+        hex_data = " ".join(f"{b:02X}" for b in data)
+        return addr, f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload=bc={bc} data={hex_data}"
     
-    # Print raw bytes from msg_info (without CRC)
-    raw_data = msg_info['raw_data']
-    print(f"  Data Length:  {len(raw_data)} bytes")
-    print(f"  Data Bytes:   ", end="")
-    for i, b in enumerate(raw_data):
-        if i > 0 and i % 16 == 0:
-            print(f"\n                 ", end="")
-        print(f"{b:02X} ", end="")
-    print()
+    # 0x10 Write Multiple Registers
+    if func == 0x10:
+        # response payload 4 bytes: start, qty
+        if len(payload) == 4:
+            start = (payload[0] << 8) | payload[1]
+            qty = (payload[2] << 8) | payload[3]
+            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WRM_RESP | payload=start=0x{start:04X} qty={qty}"
+        
+        # request: start(2) qty(2) bc(1) data(bc)
+        if len(payload) >= 5:
+            start = (payload[0] << 8) | payload[1]
+            qty = (payload[2] << 8) | payload[3]
+            bc = payload[4]
+            data = payload[5:]
+            hex_data = " ".join(f"{b:02X}" for b in data)
+            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WRM | payload=start=0x{start:04X} qty={qty} bc={bc} data={hex_data}"
     
-    print("-" * 60)
-    print()
+    # Default - use function name from lookup table if available
+    func_name = FUNCTION_NAMES.get(func, "UNKNOWN")
+    hex_payload = " ".join(f"{b:02X}" for b in payload)
+    return addr, f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload={hex_payload}"
 
 
-# Global buffer for accumulating received data (matching Rabbit C serRead approach)
-# From MODBUS_SLAVE_DCM.lib.c: ByteCount = serRead( DataAddress, 200 );
-# serRead uses Serial_timeout (5 byte times or 2msec) to detect frame end
-# The serial driver waits for timeout after last byte before returning
+# Global buffer for accumulating received data
 _rx_buf = bytearray()
-_rx_last_byte_time = 0
+_collecting = False
+_last_rx_us = 0
 
-# Frame timeout: MODBUS RTU end-of-frame detection
-# At 1843200 baud: 1 character time (start+8+stop ≈ 10 bits) = 10/1843200 ≈ 5.4 µs
-# MODBUS RTU end-of-frame = 3.5 character times ≈ 19 µs
-# Use 50 µs to be safe (allows for some timing variation)
-FRAME_TIMEOUT_US = 50
-_rx_last_byte_time = 0
+# Frame detection parameters (matching picoDCMdecoder.py)
+# At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
+INTER_FRAME_US = 120
+POLL_US = 40
 
-# Calculate timeout: 5 byte times or 2ms, whichever is greater
-# At 1843200 baud: 1 byte time = 11 bits / 1843200 = ~6us, so 5 byte times = ~30us
-# So use 2ms (2000us) as the timeout
-FRAME_TIMEOUT_US = 2000  # 2ms timeout matching Serial_timeout logic
+def is_plausible_addr(a: int) -> bool:
+    """Check if address is valid MODBUS address (0-247)"""
+    return 0 <= a <= 247
 
-def extract_messages_from_frame(frame):
+
+def is_plausible_func(f: int) -> bool:
+    """Check if function code is valid (0-127 or 0x80-0xFF for exceptions)"""
+    return (0 <= f <= 0x7F) or (0x80 <= f <= 0xFF)
+
+
+class ModbusFrameSplitter:
     """
-    Extract individual MODBUS messages from a potentially concatenated frame
-    Returns list of (payload, crc_valid, raw_msg) tuples
+    Split a byte chunk (may contain multiple RTU frames) into valid frames
+    using heuristics and CRC validation (from picoDCMdecoder.py)
     """
-    messages = []
-    idx = 0
     
-    while idx < len(frame) - 3:  # Need at least 4 bytes (addr + func + 2 CRC)
-        # Try to find a valid MODBUS message starting at idx
-        # We need to guess the message length based on function code
-        if len(frame) - idx < 4:
-            break
-        
-        addr = frame[idx]
-        func = frame[idx + 1]
-        
-        # Determine expected message length based on function code
-        msg_len = None
-        if func in [0x01, 0x02]:  # Read coils/inputs
-            if len(frame) - idx >= 8:  # addr + func + start(2) + count(2) + CRC(2)
-                count = (frame[idx + 4] << 8) | frame[idx + 5]
-                byte_count = (count + 7) // 8
-                msg_len = 6 + byte_count + 2  # header(6) + data + CRC(2)
-        elif func in [0x03, 0x04]:  # Read registers
-            if len(frame) - idx >= 8:
-                count = (frame[idx + 4] << 8) | frame[idx + 5]
-                msg_len = 6 + count * 2 + 2  # header(6) + data(count*2) + CRC(2)
-        elif func in [0x05, 0x06]:  # Write single
-            msg_len = 8  # addr + func + addr(2) + value(2) + CRC(2)
-        elif func in [0x0F, 0x10]:  # Write multiple
-            if len(frame) - idx >= 7:
-                byte_count = frame[idx + 6]
-                msg_len = 7 + byte_count + 2  # header(7) + data + CRC(2)
-        elif func == 0x17:  # Read/write multiple
-            if len(frame) - idx >= 11:
-                read_count = (frame[idx + 4] << 8) | frame[idx + 5]
-                write_byte_count = frame[idx + 10]
-                msg_len = 11 + write_byte_count + 2  # header(11) + write data + CRC(2)
-        elif func == 0x16:  # Mask write
-            msg_len = 10  # addr + func + addr(2) + and(2) + or(2) + CRC(2)
-        elif func == 0x43:  # Load attenuator (same as 0x06)
-            msg_len = 8  # addr + func + addr(2) + value(2) + CRC(2)
-        elif func == 0x44:  # Load attenuator table (same as 0x10)
-            if len(frame) - idx >= 7:
-                byte_count = frame[idx + 6]
-                msg_len = 7 + byte_count + 2  # header(7) + data + CRC(2)
-        elif func == 0xC0:  # Unknown function, might be broadcast or custom
-            # Try to determine length - might be variable
-            # For now, try minimum length and validate CRC
-            if len(frame) - idx >= 8:
-                # Try to find pattern: might be followed by another message
-                # Look for next valid address byte pattern
-                msg_len = 8  # Guess: addr + func + data(4) + CRC(2)
-            else:
-                msg_len = None
-        else:
-            # Unknown function, try minimum length
-            msg_len = 4  # addr + func + CRC(2)
-        
-        if msg_len is None or idx + msg_len > len(frame):
-            # Can't determine message length, skip this byte and try again
-            idx += 1
-            continue
-        
-        # Extract the message
-        raw_msg = frame[idx:idx + msg_len]
-        if len(raw_msg) < 4:
-            idx += 1
-            continue
-        
-        # Validate CRC
-        # When USE_MODBUS_CRC is defined, CRC is at frame[ByteCount] (MSB) and frame[ByteCount+1] (LSB)
-        # From MODBUS_SLAVE_DCM.lib.c lines 634-638:
-        #   CalcCRC = MODBUS_CRC(DataAddress, ByteCount);  // Calculate on payload
-        #   RxCRC = DataAddress[ByteCount+1] & 0x00FF;     // LSB at ByteCount+1
-        #   i = DataAddress[ByteCount]<<8;                 // MSB at ByteCount
-        #   RxCRC = RxCRC | ( i & 0xFF00 );                // Merge: (MSB << 8) | LSB
-        payload = raw_msg[:-2]
-        rx_crc_msb = raw_msg[-2]  # MSB from frame[ByteCount]
-        rx_crc_lsb = raw_msg[-1]  # LSB from frame[ByteCount+1]
-        rx_crc = (rx_crc_msb << 8) | rx_crc_lsb
-        calc_crc = crc16(payload)
-        crc_valid = (calc_crc == rx_crc)
-        
-        
-        messages.append((payload, crc_valid, raw_msg))
-        idx += msg_len
+    def __init__(self, max_frame=260):
+        self.max_frame = max_frame
     
-    return messages
-
-
-def modbus_receive(uart, max_bytes=200):
-    """
-    Receive MODBUS message from UART (matches Rabbit C MODBUS_Serial_Rx logic).
-    From MODBUS_SLAVE_DCM.lib.c line 619: ByteCount = serRead( DataAddress, 200 );
-    
-    Simply reads available bytes from UART buffer (up to max_bytes), then validates CRC.
-    Returns (message_data, crc_valid, raw_bytes) or (None, None, None) if no message
-    """
-    global _rx_buf, _rx_last_byte_time
-    
-    current_time = time.ticks_us()
-    
-    # Read available bytes from UART (matching serRead behavior)
-    # serRead waits for timeout after last byte before returning (frame detection)
-    n = uart.any()
-    if n > 0:
-        chunk = uart.read(min(n, max_bytes))
-        if chunk:
-            _rx_buf.extend(chunk)
-            _rx_last_byte_time = current_time  # Update timestamp when we receive bytes
-    
-    # Check if we have a complete frame (timeout elapsed since last byte)
-    # This matches serRead's frame detection: wait for timeout before processing
-    if len(_rx_buf) >= 4:  # Minimum: addr + func + 2 CRC bytes
-        # Check if frame is complete (no bytes received for timeout period)
-        frame_complete = False
-        if _rx_last_byte_time > 0:
-            elapsed = time.ticks_diff(current_time, _rx_last_byte_time)
-            if elapsed >= FRAME_TIMEOUT_US:
-                frame_complete = True  # Timeout elapsed, can process buffer
-        else:
-            # No timestamp yet, check buffer size as heuristic
-            if len(_rx_buf) >= max_bytes:
-                frame_complete = True  # Buffer full, process what we have
+    def _candidate_lengths(self, buf: bytes, i: int):
+        """Yield likely frame lengths from position i"""
+        if i + 2 > len(buf):
+            return
+        addr = buf[i]
+        func = buf[i + 1]
+        if not is_plausible_addr(addr) or not is_plausible_func(func):
+            return
         
-        if not frame_complete:
-            # Still receiving data, wait for timeout (frame not complete yet)
-            return None, None, None
+        # 0x06 Write Single Register: request/response fixed 8 bytes
+        if func == 0x06:
+            yield 8
         
-        # Frame group is complete (timeout elapsed or buffer full)
-        # Scan buffer to find FIRST valid message by checking CRC at different lengths
-        # Messages may be concatenated, so we need to find boundaries
-        frame = bytes(_rx_buf)
+        # 0x03/0x04 Read regs:
+        # request fixed 8 bytes
+        # response length = 5 + bytecount (bytecount at buf[i+2])
+        if func in (0x03, 0x04):
+            yield 8
+            if i + 3 <= len(buf):
+                bc = buf[i + 2]
+                yield 5 + bc
         
-        # Try to find first valid message starting from shortest possible length (4 bytes)
-        # Scan from 4 bytes up to the buffer size
-        for msg_len in range(4, len(frame) + 1):
-            if msg_len > len(frame):
+        # 0x10 Write Multiple Registers:
+        # response fixed 8 bytes
+        # request length = 9 + bytecount (bytecount at buf[i+6])
+        if func == 0x10:
+            yield 8
+            if i + 7 <= len(buf):
+                bc = buf[i + 6]
+                yield 9 + bc
+        
+        # Exception response: addr, func|0x80, exception_code, CRC => 5 bytes
+        if func & 0x80:
+            yield 5
+        
+        # Small generic lengths as fallback
+        for L in (4, 5, 6, 7, 8, 9, 10, 11, 12):
+            yield L
+    
+    def split(self, chunk: bytes):
+        """Split chunk into frames. Returns (frames, leftover_bytes)"""
+        frames = []
+        i = 0
+        n = len(chunk)
+        
+        while i < n:
+            if i + 2 > n:
                 break
             
-            byte_count = msg_len - 2  # Adjust for CRC
-            if byte_count < 2:  # Need at least addr + func
+            addr = chunk[i]
+            func = chunk[i + 1]
+            
+            if not (is_plausible_addr(addr) and is_plausible_func(func)):
+                i += 1
                 continue
             
-            # Validate CRC exactly like C code (lines 634-638 with USE_MODBUS_CRC)
-            # Note: MODBUS spec says CRC is transmitted LSB first, then MSB.
-            # However, with USE_MODBUS_CRC defined, the C code reads them in reverse:
-            # - DataAddress[ByteCount] = MSB (line 636)
-            # - DataAddress[ByteCount+1] = LSB (line 635)
-            # This matches the MODBUS_CRC() function's output byte order.
-            payload = frame[:byte_count]
-            calc_crc = crc16(payload)  # Calculate CRC on payload (line 634)
-            rx_crc_lsb = frame[byte_count + 1] & 0x00FF  # LSB at DataAddress[ByteCount+1] (line 635)
-            rx_crc_msb_word = (frame[byte_count] << 8) & 0xFF00  # MSB at DataAddress[ByteCount] (line 636)
-            rx_crc = rx_crc_lsb | rx_crc_msb_word  # Merge bytes (line 638)
+            found = None
             
-            # Check CRC (line 649)
-            if calc_crc == rx_crc:
-                # Valid message found! Extract it and remove from buffer
-                raw_msg = frame[:msg_len]
-                _rx_buf = _rx_buf[msg_len:]  # Remove processed message
-                if len(_rx_buf) == 0:
-                    _rx_last_byte_time = 0  # Reset timestamp when buffer empty
-                return payload, True, raw_msg
+            # 1) Try heuristic lengths first (fast)
+            tried = set()
+            for L in self._candidate_lengths(chunk, i):
+                if L in tried:
+                    continue
+                tried.add(L)
+                if L < 4 or L > self.max_frame:
+                    continue
+                j = i + L
+                if j <= n:
+                    frame = chunk[i:j]
+                    if check_crc(frame):
+                        found = frame
+                        break
+            
+            # 2) Fallback CRC scan
+            if found is None:
+                max_end = min(n, i + self.max_frame)
+                for j in range(i + 4, max_end + 1):
+                    frame = chunk[i:j]
+                    if check_crc(frame):
+                        found = frame
+                        break
+            
+            if found is None:
+                # Not enough bytes yet or garbage; keep tail for next time
+                break
+            
+            frames.append(found)
+            i += len(found)
         
-        # No valid CRC found in entire buffer - this shouldn't happen often
-        # Return first minimum-length message for debugging (may be partial/invalid)
-        if len(_rx_buf) >= 4:
-            payload = frame[:2]
-            raw_msg = frame[:4]
-            _rx_buf = _rx_buf[4:]  # Remove 4 bytes to prevent buffer overflow
-            if len(_rx_buf) == 0:
-                _rx_last_byte_time = 0
-            return payload, False, raw_msg
-        
-        # Buffer empty or corrupted
-        _rx_buf = bytearray()
-        _rx_last_byte_time = 0
-        return None, None, None
+        leftover = chunk[i:] if i < n else b""
+        return frames, leftover
+
+
+# Global frame splitter instance
+_frame_splitter = ModbusFrameSplitter()
+
+def modbus_receive(uart, max_bytes=512):
+    """
+    Receive MODBUS message from UART using frame splitting approach.
+    Returns (message_data, crc_valid, raw_bytes) or (None, None, None) if no message
+    """
+    global _rx_buf, _collecting, _last_rx_us
+    
+    now = time.ticks_us()
+    
+    # Read available bytes from UART
+    n = uart.any()
+    if n > 0:
+        data = uart.read(min(n, max_bytes))
+        if data:
+            _rx_buf.extend(data)
+            _collecting = True
+            _last_rx_us = now
+    
+    if _collecting:
+        idle = time.ticks_diff(now, _last_rx_us)
+        if idle >= INTER_FRAME_US:
+            # Frame group complete - split into individual frames
+            chunk = bytes(_rx_buf)
+            _rx_buf = bytearray()
+            _collecting = False
+            
+            frames, leftover = _frame_splitter.split(chunk)
+            
+            # Keep leftover (partial frame) for next round
+            if leftover:
+                _rx_buf.extend(leftover)
+                _collecting = True
+                _last_rx_us = time.ticks_us()
+            
+            # Return first frame if available
+            if frames:
+                raw_msg = frames[0]
+                payload = raw_msg[:-2]  # Remove CRC
+                crc_valid = check_crc(raw_msg)
+                return payload, crc_valid, raw_msg
     
     return None, None, None
-    
-    return None, None, None
-
-
-def test_crc():
-    """Test CRC calculation with known values"""
-    print("=" * 60)
-    print("CRC Calculation Test")
-    print("=" * 60)
-    
-    # Test with a simple message: Address 1, Function 3, Register 0x0000, Count 1
-    # Known good MODBUS message: 01 03 00 00 00 01 <CRC>
-    test_payload = bytes([0x01, 0x03, 0x00, 0x00, 0x00, 0x01])
-    calc_crc = crc16(test_payload)
-    print(f"Test payload: {test_payload.hex()}")
-    print(f"Calculated CRC: 0x{calc_crc:04X} ({calc_crc:04d})")
-    print(f"  MSB: 0x{(calc_crc >> 8) & 0xFF:02X}, LSB: 0x{calc_crc & 0xFF:02X}")
-    
-    # Standard MODBUS CRC for this message should be 0x84 0x0A (LSB first) = 0x0A84
-    # But with USE_MODBUS_CRC (MSB first), it should be different
-    print(f"\nNote: With USE_MODBUS_CRC (MSB first), CRC bytes are: 0x{(calc_crc >> 8) & 0xFF:02X} 0x{calc_crc & 0xFF:02X}")
-    print()
-
-
-def loopback_test():
-    """Test UART by sending and receiving data (connect TX to RX for loopback)"""
-    print("=" * 60)
-    print("UART Loopback Test")
-    print("=" * 60)
-    print("Connect GP0 (TX) to GP1 (RX) directly for this test")
-    print()
-    
-    uart = UART(0, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=None, stop=1)
-    
-    test_data = b'\x0E\x04\x00\x00\x00\x01'  # Address 14, read input register
-    crc = crc16(test_data)
-    test_msg = test_data + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
-    
-    print(f"Sending: {test_msg.hex()}")
-    uart.write(test_msg)
-    
-    time.sleep_ms(100)
-    
-    if uart.any():
-        received = uart.read(256)
-        print(f"Received: {received.hex()}")
-        if received == test_msg:
-            print("LOOPBACK TEST PASSED!")
-        else:
-            print("LOOPBACK TEST FAILED - data mismatch")
-    else:
-        print("LOOPBACK TEST FAILED - no data received")
-        print("Check: Is GP0 connected to GP1?")
-    print()
 
 
 def main():
     """Main test loop - receive and print MODBUS messages"""
-    print("=" * 60)
-    print("MODBUS RTU Test Module")
-    print("=" * 60)
-    print(f"Baud Rate: {MODBUS_BAUD}")
-    print("GP0: TX_E, GP1: RX_E, GP2: DRV_EN (RS-485 DE/RE)")
-    print()
-    
     # Read and display MODBUS address from hardware pins
-    mb_addr, ad0, ad1, ad2, ad3, ad4, port_b, part1, part2 = read_modbus_address()
-    print(f"MODBUS Address from pins: {mb_addr}")
-    print(f"  AD0 (GP3): {ad0}")
-    print(f"  AD1 (GP4): {ad1}")
-    print(f"  AD2 (GP5): {ad2}")
-    print(f"  AD3 (GP6): {ad3}")
-    print(f"  AD4 (GP7): {ad4}")
-    print(f"  Port_B: 0x{port_b:02X} (0b{port_b:08b})")
-    print(f"  Calculation: (0x{port_b:02X} & 0x1E) | ((0x{port_b:02X} & 0x20) >> 5)")
-    print(f"              = 0x{part1:02X} | 0x{part2:02X} = {mb_addr}")
-    print()
+    mb_addr, _, _, _, _, _, _, _, _ = read_modbus_address()
+    print(" MB address: ", mb_addr)
     
-    # Test CRC calculation
-    test_crc()
-    
-    print("Waiting for MODBUS messages (monitoring all addresses)...")
-    print("Press Ctrl+C to stop")
-    print()
-    
-    # Set up MODBUS UART
-    modbus_uart = UART(0, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=None, stop=1)
+    # Set up MODBUS UART (8E1: 8 bits, EVEN parity, 1 stop bit)
+    modbus_uart = UART(0, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=0, stop=1)
     
     # Set up RS-485 DE/RE control pin (GP2)
     de_pin = Pin(2, Pin.OUT)
@@ -527,8 +459,6 @@ def main():
     raw_byte_count = 0
     loop_count = 0
     
-    print("[DEBUG] Starting receive loop...")
-    
     try:
         while True:
             loop_count += 1
@@ -536,43 +466,26 @@ def main():
             # Receive message
             msg_data, crc_valid, raw_bytes = modbus_receive(modbus_uart)
             
-            if msg_data is not None:
+            if msg_data is not None and raw_bytes is not None:
                 message_count += 1
-                if raw_bytes:
-                    raw_byte_count += len(raw_bytes)
+                raw_byte_count += len(raw_bytes)
                 if crc_valid:
                     valid_count += 1
+                    # Decode and print message
+                    addr, decoded = decode_modbus_message(raw_bytes)
+                    if addr == mb_addr:
+                        print(decoded)
                 else:
                     invalid_count += 1
-                
-                # Parse message
-                msg_info = parse_modbus_message(msg_data)
-                
-                if msg_info:
-                    print(f"[Message #{message_count}]", end=" ")
-                    print_modbus_message(msg_info, crc_valid, raw_bytes)
-                    # Debug CRC for invalid messages
-                    if not crc_valid and raw_bytes and len(raw_bytes) >= 4:
-                        payload = raw_bytes[:-2]
-                        calc_crc = crc16(payload)
-                        rx_crc_msb = raw_bytes[-2]
-                        rx_crc_lsb = raw_bytes[-1]
-                        rx_crc = (rx_crc_msb << 8) | rx_crc_lsb
-                        print(f"  [CRC DEBUG] Payload: {payload.hex()}")
-                        print(f"  [CRC DEBUG] CalcCRC=0x{calc_crc:04X}, RxCRC=0x{rx_crc:04X} (MSB=0x{rx_crc_msb:02X}, LSB=0x{rx_crc_lsb:02X})")
-                else:
-                    print(f"[Message #{message_count}] Failed to parse message")
-                    if raw_bytes:
-                        print(f"  Raw bytes: {raw_bytes.hex()}")
-                        # Try to validate CRC anyway
+                    # Print invalid message with CRC debug info (only for messages to our address)
+                    addr, decoded = decode_modbus_message(raw_bytes)
+                    if addr == mb_addr:
+                        print(decoded + " [CRC_INVALID]")
                         if len(raw_bytes) >= 4:
                             payload = raw_bytes[:-2]
-                            calc_crc = crc16(payload)
-                            rx_crc_msb = raw_bytes[-2]
-                            rx_crc_lsb = raw_bytes[-1]
-                            rx_crc = (rx_crc_msb << 8) | rx_crc_lsb
-                            print(f"  [CRC DEBUG] Payload: {payload.hex()}")
-                            print(f"  [CRC DEBUG] CalcCRC=0x{calc_crc:04X}, RxCRC=0x{rx_crc:04X} (MSB=0x{rx_crc_msb:02X}, LSB=0x{rx_crc_lsb:02X})")
+                            calc_crc = crc16_modbus(payload)
+                            rx_crc = raw_bytes[-2] | (raw_bytes[-1] << 8)
+                            print(f"  [CRC_DEBUG] calc=0x{calc_crc:04X} rx=0x{rx_crc:04X}")
             
             # Debug output every 5 seconds
             current_time = time.ticks_ms()
@@ -585,8 +498,8 @@ def main():
                     print(f"  [DEBUG] WARNING: UART has {uart_has_data} bytes waiting!")
                 last_debug_time = current_time
             
-            # Small delay to prevent tight loop
-            time.sleep_ms(10)
+            # Small delay to prevent tight loop (matching picoDCMdecoder.py poll_us)
+            time.sleep_us(POLL_US)
     
     except KeyboardInterrupt:
         print()

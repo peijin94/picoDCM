@@ -72,15 +72,146 @@ MODBUS_CRC_LSB = bytes([
 ])
 
 
+def crc16_modbus(data: bytes) -> int:
+    """
+    Calculate MODBUS CRC16 using standard polynomial 0xA001.
+    Returns CRC16 value. CRC is appended LSB first, then MSB on the wire.
+    """
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+
 def modbus_crc(data):
-    """Calculate MODBUS CRC using lookup tables"""
-    c_hi = 0xFF
-    c_lo = 0xFF
-    for byte in data:
-        w = c_hi ^ byte
-        c_hi = c_lo ^ MODBUS_CRC_MSB[w]
-        c_lo = MODBUS_CRC_LSB[w]
-    return (c_hi << 8) | c_lo
+    """Alias for crc16_modbus for backward compatibility"""
+    return crc16_modbus(data)
+
+
+def check_crc(frame: bytes) -> bool:
+    """Check if frame has valid CRC"""
+    if len(frame) < 4:
+        return False
+    rx_crc = frame[-2] | (frame[-1] << 8)  # LSB then MSB on the wire
+    calc_crc = crc16_modbus(frame[:-2])
+    return rx_crc == calc_crc
+
+
+def is_plausible_addr(a: int) -> bool:
+    """Check if address is valid MODBUS address (0-247)"""
+    return 0 <= a <= 247
+
+
+def is_plausible_func(f: int) -> bool:
+    """Check if function code is valid (0-127 or 0x80-0xFF for exceptions)"""
+    return (0 <= f <= 0x7F) or (0x80 <= f <= 0xFF)
+
+
+class ModbusFrameSplitter:
+    """
+    Split a byte chunk (may contain multiple RTU frames) into valid frames
+    using heuristics and CRC validation (from picoMODBUStest.py)
+    """
+    
+    def __init__(self, max_frame=260):
+        self.max_frame = max_frame
+    
+    def _candidate_lengths(self, buf: bytes, i: int):
+        """Yield likely frame lengths from position i"""
+        if i + 2 > len(buf):
+            return
+        addr = buf[i]
+        func = buf[i + 1]
+        if not is_plausible_addr(addr) or not is_plausible_func(func):
+            return
+        
+        # 0x06 Write Single Register: request/response fixed 8 bytes
+        if func == 0x06:
+            yield 8
+        
+        # 0x03/0x04 Read regs:
+        # request fixed 8 bytes
+        # response length = 5 + bytecount (bytecount at buf[i+2])
+        if func in (0x03, 0x04):
+            yield 8
+            if i + 3 <= len(buf):
+                bc = buf[i + 2]
+                yield 5 + bc
+        
+        # 0x10 Write Multiple Registers:
+        # response fixed 8 bytes
+        # request length = 9 + bytecount (bytecount at buf[i+6])
+        if func == 0x10:
+            yield 8
+            if i + 7 <= len(buf):
+                bc = buf[i + 6]
+                yield 9 + bc
+        
+        # Exception response: addr, func|0x80, exception_code, CRC => 5 bytes
+        if func & 0x80:
+            yield 5
+        
+        # Small generic lengths as fallback
+        for L in (4, 5, 6, 7, 8, 9, 10, 11, 12):
+            yield L
+    
+    def split(self, chunk: bytes):
+        """Split chunk into frames. Returns (frames, leftover_bytes)"""
+        frames = []
+        i = 0
+        n = len(chunk)
+        
+        while i < n:
+            if i + 2 > n:
+                break
+            
+            addr = chunk[i]
+            func = chunk[i + 1]
+            
+            if not (is_plausible_addr(addr) and is_plausible_func(func)):
+                i += 1
+                continue
+            
+            found = None
+            
+            # 1) Try heuristic lengths first (fast)
+            tried = set()
+            for L in self._candidate_lengths(chunk, i):
+                if L in tried:
+                    continue
+                tried.add(L)
+                if L < 4 or L > self.max_frame:
+                    continue
+                j = i + L
+                if j <= n:
+                    frame = chunk[i:j]
+                    if check_crc(frame):
+                        found = frame
+                        break
+            
+            # 2) Fallback CRC scan
+            if found is None:
+                max_end = min(n, i + self.max_frame)
+                for j in range(i + 4, max_end + 1):
+                    frame = chunk[i:j]
+                    if check_crc(frame):
+                        found = frame
+                        break
+            
+            if found is None:
+                # Not enough bytes yet or garbage; keep tail for next time
+                break
+            
+            frames.append(found)
+            i += len(found)
+        
+        leftover = chunk[i:] if i < n else b""
+        return frames, leftover
 
 
 class DCMHardware:
@@ -101,8 +232,8 @@ class DCMHardware:
             opt_rx1_uart_id: UART ID for optical receiver 1 (default None)
             opt_rx2_uart_id: UART ID for optical receiver 2 (default None)
         """
-        # MODBUS UART and RS-485 control
-        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=None, stop=1)
+        # MODBUS UART and RS-485 control (8E1: 8 bits, EVEN parity, 1 stop bit)
+        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=0, stop=1)
         if modbus_de_pin is None:
             self.de_pin = Pin(2, Pin.OUT)  # PE2 equivalent
         else:
@@ -652,43 +783,72 @@ class DCM:
                              modbus_de_pin=modbus_de_pin,
                              **kwargs)
         self.modbus = ModbusSlave(self.hw)
+        
+        # Frame splitting for receiving concatenated frames
+        self._frame_splitter = ModbusFrameSplitter()
+        self._rx_buf = bytearray()
+        self._frame_queue = []  # Queue for multiple frames received in one chunk
+        self._collecting = False
+        self._last_rx_us = 0
+        
+        # Frame detection parameters (matching picoMODBUStest.py)
+        # At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
+        self.INTER_FRAME_US = 120
     
     def modbus_serial_rx(self):
-        """Receive MODBUS message from serial port"""
-        if not self.hw.modbus_uart.any():
-            return 0
+        """
+        Receive MODBUS message from serial port using frame splitting approach.
+        Returns payload data (without CRC) on success, 0 if no data, MB_CRC_ERROR if CRC invalid.
+        """
+        now = time.ticks_us()
         
-        # Read available data (up to 256 bytes)
-        data = self.hw.modbus_uart.read(256)
-        if not data or len(data) < 4:  # Minimum: addr + func + 2 CRC bytes
-            return 0
+        # Read available bytes from UART
+        n = self.hw.modbus_uart.any()
+        if n > 0:
+            data = self.hw.modbus_uart.read(min(n, 512))
+            if data:
+                self._rx_buf.extend(data)
+                self._collecting = True
+                self._last_rx_us = now
         
-        # Check CRC
-        data_len = len(data)
-        if data_len < 4:
-            return 0
+        if self._collecting:
+            idle = time.ticks_diff(now, self._last_rx_us)
+            if idle >= self.INTER_FRAME_US:
+                # Frame group complete - split into individual frames
+                chunk = bytes(self._rx_buf)
+                self._rx_buf = bytearray()
+                self._collecting = False
+                
+                frames, leftover = self._frame_splitter.split(chunk)
+                
+                # Keep leftover (partial frame) for next round
+                if leftover:
+                    self._rx_buf.extend(leftover)
+                    self._collecting = True
+                    self._last_rx_us = time.ticks_us()
+                
+                # Queue all valid frames for processing
+                for raw_msg in frames:
+                    payload = raw_msg[:-2]  # Remove CRC
+                    if check_crc(raw_msg):
+                        self._frame_queue.append(payload)
+                
+        # Return next queued frame if available
+        if self._frame_queue:
+            return self._frame_queue.pop(0)
         
-        # Extract CRC from last 2 bytes (LSB first for MODBUS_CRC)
-        rx_crc = data[data_len - 1] | (data[data_len - 2] << 8)
-        
-        # Calculate CRC
-        calc_crc = modbus_crc(data[:-2])
-        
-        if calc_crc != rx_crc:
-            return MB_CRC_ERROR
-        
-        return data[:-2]  # Return data without CRC
+        return 0  # No complete frame yet
     
     def modbus_serial_tx(self, data):
         """Transmit MODBUS message to serial port"""
         if not data:
             return
         
-        # Calculate and append CRC (LSB first)
-        crc = modbus_crc(data)
+        # Calculate and append CRC (LSB first, then MSB on the wire)
+        crc = crc16_modbus(data)
         tx_data = bytearray(data)
-        tx_data.append((crc >> 8) & 0xFF)  # MSB
-        tx_data.append(crc & 0xFF)  # LSB
+        tx_data.append(crc & 0xFF)  # LSB first
+        tx_data.append((crc >> 8) & 0xFF)  # MSB second
         
         # Enable transmit
         self.hw.de_pin.value(1)
