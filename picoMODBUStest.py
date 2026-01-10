@@ -221,7 +221,7 @@ def decode_modbus_message(frame: bytes) -> (int, str):
         if reg == 0x0000:
             atn1 = (val >> 8) & 0xFF
             atn2 = val & 0xFF
-            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} ATN1={atn1}dB ATN2={atn2}dB"
+            return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} ATN1={atn1} ATN2={atn2}"
         
         return addr, f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} val=0x{val:04X}"
     

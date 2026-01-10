@@ -20,6 +20,49 @@ BUFFER_LEN = 132
 FIRMWARE_REV = 6
 MODBUS_BAUD = 1843200
 
+# Pin definitions
+MODBUS_TX_PIN = 0    # GP0 - UART TX for MODBUS
+MODBUS_RX_PIN = 1    # GP1 - UART RX for MODBUS
+MODBUS_DE_PIN = 2    # GP2 - RS-485 DE/RE control pin
+
+# Address pins (AD0-AD4)
+AD0_PIN = 3   # GP3 - PB5 (AD0)
+AD1_PIN = 4   # GP4 - PB1 (AD1)
+AD2_PIN = 5   # GP5 - PB2 (AD2)
+AD3_PIN = 6   # GP6 - PB3 (AD3)
+AD4_PIN = 7   # GP7 - PB4 (AD4)
+
+# Attenuator output pins (PA0-PA7, Port A equivalent)
+PA0_PIN = 10  # GP10
+PA1_PIN = 11  # GP11
+PA2_PIN = 12  # GP12
+PA3_PIN = 13  # GP13
+PA4_PIN = 14  # GP14
+PA5_PIN = 15  # GP15
+PA6_PIN = 16  # GP16
+PA7_PIN = 17  # GP17
+ATTEN_PINS = list(range(10, 18))  # GP10-GP17
+
+# Digital input pin
+DIG_IN_PIN = 3  # GP3 - LO2_LOCK monitor (same as AD0, check hardware design)
+
+# Optical receiver UART pins
+OPT_RX1_TX_PIN = 4  # GP4 - Optical receiver 1 TX
+OPT_RX1_RX_PIN = 5  # GP5 - Optical receiver 1 RX
+OPT_RX2_TX_PIN = 6  # GP6 - Optical receiver 2 TX
+OPT_RX2_RX_PIN = 7  # GP7 - Optical receiver 2 RX
+
+# ADC input pins
+ADC_LN0_PIN = 26  # GP26 - LN0 detector output
+ADC_LN1_PIN = 27  # GP27 - LN1 detector output
+ADC_A2_PIN = 28   # GP28 - A2 ADC input
+
+# Debug flag - diagnostics print when DEBUG_ENV=False (inverted logic for production diagnostics)
+DEBUG_ENV = True  # Set to True to suppress diagnostics, False to print them
+PRINT_MY_ADDRESS_ONLY = True  # Set to True to print only my address, False to print all messages
+PRINT_TICK = False  # Set to True to print tick messages, False to print only my address
+OVERRIDE_MB_ADDRESS = 14  # Set to the desired MB address, 0 to use the address from the hardware
+
 # MODBUS Error codes
 MB_SUCCESS = 0
 MB_BADFUNC = 0x01
@@ -110,6 +153,105 @@ def is_plausible_addr(a: int) -> bool:
 def is_plausible_func(f: int) -> bool:
     """Check if function code is valid (0-127 or 0x80-0xFF for exceptions)"""
     return (0 <= f <= 0x7F) or (0x80 <= f <= 0xFF)
+
+
+def hex_bytes(b: bytes, sep=" ") -> str:
+    """Convert bytes to hex string"""
+    return sep.join("{:02X}".format(x) for x in b)
+
+
+def u16_be(b0: int, b1: int) -> int:
+    """Convert two bytes to big-endian uint16"""
+    return (b0 << 8) | b1
+
+
+class DCMDecoder:
+    """
+    Decode MODBUS frames to human-readable format (matching picoDCMdecoder.py).
+    Can decode full frames (with CRC) or payload-only data (without CRC).
+    """
+    
+    def decode(self, frame_or_payload: bytes, has_crc: bool = True) -> str:
+        """
+        Decode MODBUS frame or payload to formatted string.
+        
+        Args:
+            frame_or_payload: Full frame (with CRC) or payload (without CRC)
+            has_crc: True if frame includes CRC (last 2 bytes), False if payload only
+        
+        Returns:
+            Formatted string: addr=XX | func=0xXXXX | funcName=NAME | payload=...
+        """
+        if has_crc:
+            if len(frame_or_payload) < 4:
+                return f"INVALID (too short: {len(frame_or_payload)} bytes)"
+            frame = frame_or_payload
+            payload = frame[2:-2]
+        else:
+            if len(frame_or_payload) < 2:
+                return f"INVALID (too short: {len(frame_or_payload)} bytes)"
+            frame = frame_or_payload
+            payload = frame[2:] if len(frame) > 2 else b""
+        
+        addr = frame[0]
+        func = frame[1]
+        
+        # Exception response
+        if func & 0x80 and len(payload) >= 1:
+            exc = payload[0]
+            return f"addr={addr:2} | func=0x{func:04X} | funcName=EXCEPTION | payload=0x{exc:02X}"
+        
+        # 0x06 Write Single Register
+        if func == 0x06 and len(payload) == 4:
+            reg = u16_be(payload[0], payload[1])
+            val = u16_be(payload[2], payload[3])
+            
+            if reg == 0x0000:
+                atn1 = (val >> 8) & 0xFF
+                atn2 = val & 0xFF
+                return f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} ATN1={atn1}dB ATN2={atn2}dB"
+            
+            return f"addr={addr:2} | func=0x{func:04X} | funcName=WR1 | payload=reg=0x{reg:04X} val=0x{val:04X}"
+        
+        # 0x03/0x04 Read regs request
+        if func in (0x03, 0x04) and len(payload) == 4:
+            start = u16_be(payload[0], payload[1])
+            qty = u16_be(payload[2], payload[3])
+            func_name = "RDH" if func == 0x03 else "RDI"
+            return f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload=start=0x{start:04X} qty={qty}"
+        
+        # 0x03/0x04 Read regs response: bytecount + data
+        if func in (0x03, 0x04) and len(payload) >= 1:
+            bc = payload[0]
+            data = payload[1:]
+            if bc == len(data) and (bc % 2 == 0):
+                regs = []
+                for k in range(0, bc, 2):
+                    regs.append(u16_be(data[k], data[k + 1]))
+                func_name = "RDH_RESP" if func == 0x03 else "RDI_RESP"
+                regs_str = " ".join(f"0x{r:04X}" for r in regs)
+                return f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload={regs_str}"
+            func_name = "RDH_RESP" if func == 0x03 else "RDI_RESP"
+            return f"addr={addr:2} | func=0x{func:04X} | funcName={func_name} | payload=bc={bc} data={hex_bytes(data)}"
+        
+        # 0x10 Write Multiple Registers
+        if func == 0x10:
+            # response payload 4 bytes: start, qty
+            if len(payload) == 4:
+                start = u16_be(payload[0], payload[1])
+                qty = u16_be(payload[2], payload[3])
+                return f"addr={addr:2} | func=0x{func:04X} | funcName=WRM_RESP | payload=start=0x{start:04X} qty={qty}"
+            
+            # request: start(2) qty(2) bc(1) data(bc)
+            if len(payload) >= 5:
+                start = u16_be(payload[0], payload[1])
+                qty = u16_be(payload[2], payload[3])
+                bc = payload[4]
+                data = payload[5:]
+                return f"addr={addr:2} | func=0x{func:04X} | funcName=WRM | payload=start=0x{start:04X} qty={qty} bc={bc} data={hex_bytes(data)}"
+        
+        # Default
+        return f"addr={addr:2} | func=0x{func:04X} | funcName=UNKNOWN | payload={hex_bytes(payload)}"
 
 
 class ModbusFrameSplitter:
@@ -233,23 +375,50 @@ class DCMHardware:
             opt_rx2_uart_id: UART ID for optical receiver 2 (default None)
         """
         # MODBUS UART and RS-485 control (8E1: 8 bits, EVEN parity, 1 stop bit)
-        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(0), rx=Pin(1), bits=8, parity=0, stop=1)
+        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(MODBUS_TX_PIN), rx=Pin(MODBUS_RX_PIN), bits=8, parity=0, stop=1)
         if modbus_de_pin is None:
-            self.de_pin = Pin(2, Pin.OUT)  # PE2 equivalent
+            self.de_pin = Pin(MODBUS_DE_PIN, Pin.OUT)  # GP2 - RS-485 DE/RE control
         else:
             self.de_pin = Pin(modbus_de_pin, Pin.OUT)
         self.de_pin.value(0)  # Start in receive mode
         
         # Address pins - read MODBUS address from hardware
         # On Rabbit: PB1=AD1, PB2=AD2, PB3=AD3, PB4=AD4, PB5=AD0
-        # Address = (PB5<<4) | (PB1) | (PB2<<1) | (PB3<<2) | (PB4<<3)
+        # Address = ((Port_B & 0x1E) | ((Port_B & 0x20)>>5))
         if addr_pins is None:
-            # Default: try to read from pins if available
-            # User should configure based on actual hardware
-            self.mb_address = 1  # Default address
+            # Default: read from hardware pins
+            if OVERRIDE_MB_ADDRESS > 0:
+                self.mb_address = OVERRIDE_MB_ADDRESS
+                if DEBUG_ENV:
+                    print(f"[INIT] MB address (override): {self.mb_address}")
+            else:
+                # Read from hardware pins
+                ad0 = Pin(AD0_PIN, Pin.IN, Pin.PULL_DOWN)
+                ad1 = Pin(AD1_PIN, Pin.IN, Pin.PULL_DOWN)
+                ad2 = Pin(AD2_PIN, Pin.IN, Pin.PULL_DOWN)
+                ad3 = Pin(AD3_PIN, Pin.IN, Pin.PULL_DOWN)
+                ad4 = Pin(AD4_PIN, Pin.IN, Pin.PULL_DOWN)
+                
+                port_b = 0
+                if ad0.value():  # PB5 (AD0)
+                    port_b |= 0x20
+                if ad1.value():  # PB1 (AD1)
+                    port_b |= 0x02
+                if ad2.value():  # PB2 (AD2)
+                    port_b |= 0x04
+                if ad3.value():  # PB3 (AD3)
+                    port_b |= 0x08
+                if ad4.value():  # PB4 (AD4)
+                    port_b |= 0x10
+                
+                # Calculate address: ((Port_B & 0x1E) | ((Port_B & 0x20)>>5))
+                self.mb_address = ((port_b & 0x1E) | ((port_b & 0x20) >> 5))
+                if DEBUG_ENV:
+                    print(f"[INIT] MB address (from pins): {self.mb_address}")
         else:
+            # Use provided address pins
             port_b = 0
-            for i, pin_num in enumerate([5, 1, 2, 3, 4]):  # PB5, PB1, PB2, PB3, PB4
+            for i, pin_num in enumerate([AD0_PIN, AD1_PIN, AD2_PIN, AD3_PIN, AD4_PIN]):
                 if i < len(addr_pins):
                     pin = Pin(addr_pins[i], Pin.IN, Pin.PULL_DOWN)
                     if pin.value():
@@ -259,33 +428,38 @@ class DCMHardware:
                             port_b |= (1 << i)
             # Calculate address: (PB5>>5) | (PB1-PB4 masked and shifted)
             self.mb_address = ((port_b & 0x1E) | ((port_b & 0x20) >> 5))
+            if DEBUG_ENV:
+                print(f"[INIT] MB address (from provided pins): {self.mb_address}")
         
-        # Attenuator control - 8-bit output (Port A equivalent)
+        # Attenuator control - 8-bit output (Port A equivalent, GP10-GP17)
         if atten_pins is None:
-            # Default: use GPIO pins 16-23 for 8-bit attenuator output
-            self.atten_pins = [Pin(i, Pin.OUT) for i in range(16, 24)]
+            # Default: use GPIO pins 10-17 for 8-bit attenuator output
+            self.atten_pins = [Pin(i, Pin.OUT) for i in ATTEN_PINS]
         else:
             self.atten_pins = [Pin(p, Pin.OUT) for p in atten_pins]
         
         # Digital input (PC3 equivalent for LO2_LOCK monitor)
+        # Note: DIG_IN_PIN uses GP3 which is same as AD0_PIN - check hardware design
         if dig_in_pin is None:
-            self.dig_in_pin = Pin(3, Pin.IN, Pin.PULL_DOWN)
+            self.dig_in_pin = Pin(DIG_IN_PIN, Pin.IN, Pin.PULL_DOWN)
         else:
             self.dig_in_pin = Pin(dig_in_pin, Pin.IN, Pin.PULL_DOWN)
         
         # Optical receiver UARTs (Serial C and D)
         if opt_rx1_uart_id is not None:
-            self.opt_rx1_uart = UART(opt_rx1_uart_id, 9600, tx=Pin(4), rx=Pin(5))
+            self.opt_rx1_uart = UART(opt_rx1_uart_id, 9600, tx=Pin(OPT_RX1_TX_PIN), rx=Pin(OPT_RX1_RX_PIN))
         else:
             self.opt_rx1_uart = None
         
         if opt_rx2_uart_id is not None:
-            self.opt_rx2_uart = UART(opt_rx2_uart_id, 9600, tx=Pin(6), rx=Pin(7))
+            self.opt_rx2_uart = UART(opt_rx2_uart_id, 9600, tx=Pin(OPT_RX2_TX_PIN), rx=Pin(OPT_RX2_RX_PIN))
         else:
             self.opt_rx2_uart = None
         
         # ADC (if needed - can be added later)
-        # self.adc = ADC(Pin(26))  # Example ADC pin
+        # self.adc_ln0 = ADC(Pin(ADC_LN0_PIN))  # LN0 detector output
+        # self.adc_ln1 = ADC(Pin(ADC_LN1_PIN))  # LN1 detector output
+        # self.adc_a2 = ADC(Pin(ADC_A2_PIN))    # A2 ADC input
         
         # Initialize state variables
         self.atten_set = 0xFF  # Initial attenuation: 15dB
@@ -791,6 +965,9 @@ class DCM:
         self._collecting = False
         self._last_rx_us = 0
         
+        # Decoder for formatted output
+        self._decoder = DCMDecoder()
+        
         # Frame detection parameters (matching picoMODBUStest.py)
         # At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
         self.INTER_FRAME_US = 120
@@ -828,14 +1005,39 @@ class DCM:
                     self._last_rx_us = time.ticks_us()
                 
                 # Queue all valid frames for processing
+                if DEBUG_ENV:
+                    if not PRINT_MY_ADDRESS_ONLY:
+                        print(f"[RX] Split: {len(frames)} frames, {len(leftover)} leftover bytes")
+                    else:
+                        pass
+                
                 for raw_msg in frames:
                     payload = raw_msg[:-2]  # Remove CRC
                     if check_crc(raw_msg):
                         self._frame_queue.append(payload)
+                        if DEBUG_ENV:
+                            addr = payload[0] if len(payload) > 0 else 0
+                            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
+                                pass
+                            else:
+                                decoded = self._decoder.decode(payload, has_crc=False)
+                                print(f"[RX] {decoded}")
+                    else:
+                        if DEBUG_ENV:
+                            addr = payload[0] if len(payload) > 0 else 0
+                            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
+                                pass
+                            else:
+                                decoded = self._decoder.decode(payload, has_crc=False)
+                                rx_crc = raw_msg[-2] | (raw_msg[-1] << 8)
+                                calc_crc = crc16_modbus(payload)
+                                print(f"[RX] {decoded} [CRC_ERROR: calc=0x{calc_crc:04X} rx=0x{rx_crc:04X}]")
                 
         # Return next queued frame if available
         if self._frame_queue:
-            return self._frame_queue.pop(0)
+            frame = self._frame_queue.pop(0)
+            # Don't print here - will be printed in tick() when processed
+            return frame
         
         return 0  # No complete frame yet
     
@@ -849,6 +1051,14 @@ class DCM:
         tx_data = bytearray(data)
         tx_data.append(crc & 0xFF)  # LSB first
         tx_data.append((crc >> 8) & 0xFF)  # MSB second
+        
+        if DEBUG_ENV:
+            addr = data[0] if len(data) > 0 else 0
+            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
+                pass
+            else:
+                decoded = self._decoder.decode(data, has_crc=False)
+                print(f"[TX] {decoded}")
         
         # Enable transmit
         self.hw.de_pin.value(1)
@@ -872,25 +1082,58 @@ class DCM:
         if rx_data == 0:
             return  # No data
         elif rx_data == MB_CRC_ERROR:
+            if DEBUG_ENV and PRINT_TICK:
+                if not PRINT_MY_ADDRESS_ONLY:
+                    print("[TICK] CRC error - ignoring frame")
+                else:
+                    pass
             return  # CRC error, ignore
         
         if len(rx_data) < 2:
+            if DEBUG_ENV and PRINT_TICK:
+                if not PRINT_MY_ADDRESS_ONLY:
+                    print(f"[TICK] Frame too short: {len(rx_data)} bytes")
+                else:
+                    pass
             return
         
         addr = rx_data[0]
         func = rx_data[1]
+        
+        if DEBUG_ENV:
+            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
+                pass
+            else:
+                decoded = self._decoder.decode(rx_data, has_crc=False)
+                if PRINT_TICK:
+                    print(f"[TICK] Processing: {decoded}")
         
         # Check if message is for this device
         if addr == self.hw.mb_address:
             # Execute command
             reply = self.modbus.execute(rx_data)
             if reply:
+                if DEBUG_ENV and PRINT_TICK:
+                    print(f"[TICK] Command executed, sending reply")
                 self.modbus_serial_tx(reply)
+            else:
+                if DEBUG_ENV and PRINT_TICK:
+                    print(f"[TICK] Command executed, no reply")
         elif addr == 0 and func == 0x45:  # Event trigger (0x45 = 69 decimal = 'E')
+            if DEBUG_ENV and PRINT_TICK:
+                decoded = self._decoder.decode(rx_data, has_crc=False)
+                print(f"[TICK] Event trigger: {decoded}")
             self.hw.event_trigger()
         elif addr == 0 and func in [0x44, 0x43]:  # Broadcast commands (0x44=68='D', 0x43=67='C')
+            if DEBUG_ENV and PRINT_TICK:
+                decoded = self._decoder.decode(rx_data, has_crc=False)
+                print(f"[TICK] Broadcast command: {decoded}")
             # Execute broadcast command but don't send reply
             self.modbus.execute(rx_data)
+        else:
+            if DEBUG_ENV and PRINT_TICK:
+                decoded = self._decoder.decode(rx_data, has_crc=False)
+                print(f"[TICK] Address mismatch: {decoded}")
 
 
 def main():
