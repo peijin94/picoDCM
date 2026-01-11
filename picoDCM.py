@@ -8,7 +8,6 @@ with support for:
 - Digital I/O
 - Analog inputs (ADC)
 - Attenuator control (normal and table modes)
-- Serial communication with optical receivers
 """
 
 from machine import UART, Pin, ADC
@@ -46,12 +45,6 @@ ATTEN_PINS = list(range(10, 18))  # GP10-GP17
 # Digital input pin
 DIG_IN_PIN = 3  # GP3 - LO2_LOCK monitor (same as AD0, check hardware design)
 
-# Optical receiver UART pins
-OPT_RX1_TX_PIN = 4  # GP4 - Optical receiver 1 TX
-OPT_RX1_RX_PIN = 5  # GP5 - Optical receiver 1 RX
-OPT_RX2_TX_PIN = 6  # GP6 - Optical receiver 2 TX
-OPT_RX2_RX_PIN = 7  # GP7 - Optical receiver 2 RX
-
 # ADC input pins
 ADC_LN0_PIN = 26  # GP26 - LN0 detector output
 ADC_LN1_PIN = 27  # GP27 - LN1 detector output
@@ -61,7 +54,6 @@ ADC_A2_PIN = 28   # GP28 - A2 ADC input
 DEBUG_ENV = True  # Set to True to suppress diagnostics, False to print them
 PRINT_MY_ADDRESS_ONLY = True  # Set to True to print only my address, False to print all messages
 PRINT_TICK = False  # Set to True to print tick messages, False to print only my address
-OVERRIDE_MB_ADDRESS = 14  # Set to the desired MB address, 0 to use the address from the hardware
 
 # MODBUS Error codes
 MB_SUCCESS = 0
@@ -361,7 +353,7 @@ class DCMHardware:
     
     def __init__(self, modbus_uart_id=0, modbus_de_pin=None,
                  addr_pins=None, atten_pins=None,
-                 dig_in_pin=None, opt_rx1_uart_id=None, opt_rx2_uart_id=None):
+                 dig_in_pin=None):
         """
         Initialize DCM hardware
         
@@ -371,8 +363,6 @@ class DCMHardware:
             addr_pins: List of pins for reading MODBUS address (default None, will try to read from hardware)
             atten_pins: List of 8 pins for attenuator output (default None, will use GPIO pins)
             dig_in_pin: Pin for digital input (default None)
-            opt_rx1_uart_id: UART ID for optical receiver 1 (default None)
-            opt_rx2_uart_id: UART ID for optical receiver 2 (default None)
         """
         # MODBUS UART and RS-485 control (8E1: 8 bits, EVEN parity, 1 stop bit)
         self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(MODBUS_TX_PIN), rx=Pin(MODBUS_RX_PIN), bits=8, parity=0, stop=1)
@@ -386,35 +376,27 @@ class DCMHardware:
         # On Rabbit: PB1=AD1, PB2=AD2, PB3=AD3, PB4=AD4, PB5=AD0
         # Address = ((Port_B & 0x1E) | ((Port_B & 0x20)>>5))
         if addr_pins is None:
-            # Default: read from hardware pins
-            if OVERRIDE_MB_ADDRESS > 0:
-                self.mb_address = OVERRIDE_MB_ADDRESS
-                if DEBUG_ENV:
-                    print(f"[INIT] MB address (override): {self.mb_address}")
-            else:
-                # Read from hardware pins
-                ad0 = Pin(AD0_PIN, Pin.IN, Pin.PULL_DOWN)
-                ad1 = Pin(AD1_PIN, Pin.IN, Pin.PULL_DOWN)
-                ad2 = Pin(AD2_PIN, Pin.IN, Pin.PULL_DOWN)
-                ad3 = Pin(AD3_PIN, Pin.IN, Pin.PULL_DOWN)
-                ad4 = Pin(AD4_PIN, Pin.IN, Pin.PULL_DOWN)
-                
-                port_b = 0
-                if ad0.value():  # PB5 (AD0)
-                    port_b |= 0x20
-                if ad1.value():  # PB1 (AD1)
-                    port_b |= 0x02
-                if ad2.value():  # PB2 (AD2)
-                    port_b |= 0x04
-                if ad3.value():  # PB3 (AD3)
-                    port_b |= 0x08
-                if ad4.value():  # PB4 (AD4)
-                    port_b |= 0x10
-                
-                # Calculate address: ((Port_B & 0x1E) | ((Port_B & 0x20)>>5))
-                self.mb_address = ((port_b & 0x1E) | ((port_b & 0x20) >> 5))
-                if DEBUG_ENV:
-                    print(f"[INIT] MB address (from pins): {self.mb_address}")
+            # Read from hardware pins
+            ad0 = Pin(AD0_PIN, Pin.IN, Pin.PULL_DOWN)
+            ad1 = Pin(AD1_PIN, Pin.IN, Pin.PULL_DOWN)
+            ad2 = Pin(AD2_PIN, Pin.IN, Pin.PULL_DOWN)
+            ad3 = Pin(AD3_PIN, Pin.IN, Pin.PULL_DOWN)
+            ad4 = Pin(AD4_PIN, Pin.IN, Pin.PULL_DOWN)
+            
+            port_b = 0
+            if ad0.value():  # PB5 (AD0)
+                port_b |= 0x20
+            if ad1.value():  # PB1 (AD1)
+                port_b |= 0x02
+            if ad2.value():  # PB2 (AD2)
+                port_b |= 0x04
+            if ad3.value():  # PB3 (AD3)
+                port_b |= 0x08
+            if ad4.value():  # PB4 (AD4)
+                port_b |= 0x10
+            
+            # Calculate address: ((Port_B & 0x1E) | ((Port_B & 0x20)>>5))
+            self.mb_address = ((port_b & 0x1E) | ((port_b & 0x20) >> 5))
         else:
             # Use provided address pins
             port_b = 0
@@ -428,8 +410,9 @@ class DCMHardware:
                             port_b |= (1 << i)
             # Calculate address: (PB5>>5) | (PB1-PB4 masked and shifted)
             self.mb_address = ((port_b & 0x1E) | ((port_b & 0x20) >> 5))
-            if DEBUG_ENV:
-                print(f"[INIT] MB address (from provided pins): {self.mb_address}")
+        
+        # Always print the MODBUS address
+        print(f"MODBUS Address from pins: {self.mb_address}")
         
         # Attenuator control - 8-bit output (Port A equivalent, GP10-GP17)
         if atten_pins is None:
@@ -445,17 +428,6 @@ class DCMHardware:
         else:
             self.dig_in_pin = Pin(dig_in_pin, Pin.IN, Pin.PULL_DOWN)
         
-        # Optical receiver UARTs (Serial C and D)
-        if opt_rx1_uart_id is not None:
-            self.opt_rx1_uart = UART(opt_rx1_uart_id, 9600, tx=Pin(OPT_RX1_TX_PIN), rx=Pin(OPT_RX1_RX_PIN))
-        else:
-            self.opt_rx1_uart = None
-        
-        if opt_rx2_uart_id is not None:
-            self.opt_rx2_uart = UART(opt_rx2_uart_id, 9600, tx=Pin(OPT_RX2_TX_PIN), rx=Pin(OPT_RX2_RX_PIN))
-        else:
-            self.opt_rx2_uart = None
-        
         # ADC (if needed - can be added later)
         # self.adc_ln0 = ADC(Pin(ADC_LN0_PIN))  # LN0 detector output
         # self.adc_ln1 = ADC(Pin(ADC_LN1_PIN))  # LN1 detector output
@@ -470,12 +442,6 @@ class DCMHardware:
         self.atten_table = [0xFF] * 50  # 50 entries, all initialized to 15dB
         
         self.dig_out_value = 0
-        
-        # Optical receiver message buffers
-        self.opt_rx1_msg = bytearray(BUFFER_LEN)
-        self.opt_rx2_msg = bytearray(BUFFER_LEN)
-        self.opt_rx1_msg[:] = b'opt_rx1 status buffer is empty\x00' + b'\x00' * (BUFFER_LEN - 33)
-        self.opt_rx2_msg[:] = b'opt_rx2 status buffer is empty\x00' + b'\x00' * (BUFFER_LEN - 33)
         
         # Initialize attenuator output
         self._write_attenuator(self.atten_state)
@@ -511,56 +477,9 @@ class DCMHardware:
         return 0
     
     def dig_out(self, channel, state):
-        """Digital output (for optical receiver status reads)"""
-        if channel == 0 and self.opt_rx1_uart:
-            # Read status from OPT_RX1
-            cmd = b"READ\n"
-            self.opt_rx1_uart.write(cmd)
-            time.sleep_ms(10)
-            
-            # Clear buffer
-            self.opt_rx1_msg[:] = b'\x00' * BUFFER_LEN
-            
-            # Read response with timeout
-            timeout = 600
-            count = 0
-            while count < timeout:
-                if self.opt_rx1_uart.any():
-                    data = self.opt_rx1_uart.read(BUFFER_LEN)
-                    if data:
-                        length = min(len(data), BUFFER_LEN)
-                        self.opt_rx1_msg[:length] = data[:length]
-                        break
-                time.sleep_ms(1)
-                count += 1
-            
-            if count >= timeout:
-                self.opt_rx1_msg[:] = b'opt_rx1 read status failed\x00' + b'\x00' * (BUFFER_LEN - 27)
-        
-        elif channel == 1 and self.opt_rx2_uart:
-            # Read status from OPT_RX2
-            cmd = b"READ\n"
-            self.opt_rx2_uart.write(cmd)
-            time.sleep_ms(10)
-            
-            # Clear buffer
-            self.opt_rx2_msg[:] = b'\x00' * BUFFER_LEN
-            
-            # Read response with timeout
-            timeout = 600
-            count = 0
-            while count < timeout:
-                if self.opt_rx2_uart.any():
-                    data = self.opt_rx2_uart.read(BUFFER_LEN)
-                    if data:
-                        length = min(len(data), BUFFER_LEN)
-                        self.opt_rx2_msg[:length] = data[:length]
-                        break
-                time.sleep_ms(1)
-                count += 1
-            
-            if count >= timeout:
-                self.opt_rx2_msg[:] = b'opt_rx2 read status failed\x00' + b'\x00' * (BUFFER_LEN - 27)
+        """Digital output (no-op, reserved for future use)"""
+        # Digital output functionality removed - optical receiver support removed
+        pass
     
     def dig_out_bank(self, bank, data):
         """Digital output bank (attenuator control)"""
@@ -589,24 +508,9 @@ class DCMHardware:
     
     def rd_holding_reg(self, address):
         """Read holding register"""
-        if address <= (BUFFER_LEN // 2) - 1:
-            # OPT_RX1 buffer - each address represents 2 bytes (1 word)
-            byte1_idx = address * 2
-            byte2_idx = byte1_idx + 1
-            if byte2_idx < BUFFER_LEN:
-                byte1 = self.opt_rx1_msg[byte1_idx]
-                byte2 = self.opt_rx1_msg[byte2_idx]
-                # Return as MODBUS word (MSB first)
-                return (byte1 << 8) | byte2
-        elif address <= BUFFER_LEN - 1:
-            # OPT_RX2 buffer
-            byte1_idx = (address - (BUFFER_LEN // 2)) * 2
-            byte2_idx = byte1_idx + 1
-            if byte2_idx < BUFFER_LEN:
-                byte1 = self.opt_rx2_msg[byte1_idx]
-                byte2 = self.opt_rx2_msg[byte2_idx]
-                # Return as MODBUS word (MSB first)
-                return (byte1 << 8) | byte2
+        if address <= BUFFER_LEN - 1:
+            # Optical receiver buffers removed - return 0
+            return 0
         elif address == BUFFER_LEN:
             # Attenuator state
             byte_low = self.atten_state & 0x0F
@@ -1042,36 +946,34 @@ class DCM:
         return 0  # No complete frame yet
     
     def modbus_serial_tx(self, data):
-        """Transmit MODBUS message to serial port"""
         if not data:
             return
-        
-        # Calculate and append CRC (LSB first, then MSB on the wire)
+
         crc = crc16_modbus(data)
         tx_data = bytearray(data)
-        tx_data.append(crc & 0xFF)  # LSB first
-        tx_data.append((crc >> 8) & 0xFF)  # MSB second
-        
-        if DEBUG_ENV:
-            addr = data[0] if len(data) > 0 else 0
-            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
-                pass
-            else:
-                decoded = self._decoder.decode(data, has_crc=False)
-                print(f"[TX] {decoded}")
-        
-        # Enable transmit
+        tx_data.append(crc & 0xFF)          # LSB
+        tx_data.append((crc >> 8) & 0xFF)   # MSB
+
+        # Enable driver
         self.hw.de_pin.value(1)
-        time.sleep_us(100)  # Small delay
-        
-        # Send data
+        time.sleep_us(50)  # allow transceiver to enable
+
+        # Write bytes
         self.hw.modbus_uart.write(tx_data)
-        
-        # Wait for transmission to complete
-        while self.hw.modbus_uart.txdone() == False:
-            time.sleep_us(10)
-        
-        # Disable transmit (return to receive mode)
+
+        # Conservative hold time: assume 11 bits/byte for 8E1
+        bits_per_byte = 11
+        tx_time_us = int(len(tx_data) * bits_per_byte * 1_000_000 / MODBUS_BAUD)
+        time.sleep_us(tx_time_us + 80)  # extra margin
+
+        # Optional: still wait on txdone if supported
+        try:
+            while not self.hw.modbus_uart.txdone():
+                time.sleep_us(10)
+        except AttributeError:
+            pass
+
+        time.sleep_us(50)  # tail margin
         self.hw.de_pin.value(0)
     
     def tick(self):
@@ -1144,7 +1046,7 @@ def main():
     # Main loop
     while True:
         dcm.tick()
-        time.sleep_ms(1)  # Small delay to prevent tight loop
+        #time.sleep_ms(1)  # Small delay to prevent tight loop
 
 
 if __name__ == "__main__":
