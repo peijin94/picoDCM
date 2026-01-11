@@ -2,6 +2,8 @@
 
 MicroPython implementation of EOVSA Downconverter Module (DCM) controller for Raspberry Pi Pico, migrated from Rabbit Single Board Computer C code.
 
+issue: https://github.com/ovro-eovsa/eovsa15-issues/issues/51
+
 ## Overview
 
 This module implements MODBUS RTU slave functionality for controlling DCM hardware, including:
@@ -66,3 +68,5 @@ GP28 - ADC_A2
 ## License
 
 GPT-4.1
+
+
