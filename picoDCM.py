@@ -428,10 +428,10 @@ class DCMHardware:
         else:
             self.dig_in_pin = Pin(dig_in_pin, Pin.IN, Pin.PULL_DOWN)
         
-        # ADC (if needed - can be added later)
-        # self.adc_ln0 = ADC(Pin(ADC_LN0_PIN))  # LN0 detector output
-        # self.adc_ln1 = ADC(Pin(ADC_LN1_PIN))  # LN1 detector output
-        # self.adc_a2 = ADC(Pin(ADC_A2_PIN))    # A2 ADC input
+        # ADC initialization for analog inputs
+        self.adc_ln0 = ADC(Pin(ADC_LN0_PIN))  # LN0 detector output (GP26)
+        self.adc_ln1 = ADC(Pin(ADC_LN1_PIN))  # LN1 detector output (GP27)
+        self.adc_a2 = ADC(Pin(ADC_A2_PIN))    # A2 ADC input (GP28)
         
         # Initialize state variables
         self.atten_set = 0xFF  # Initial attenuation: 15dB
@@ -459,18 +459,30 @@ class DCMHardware:
     
     def dig_in_bank(self, bank):
         """Read digital input bank (ADC equivalent)"""
-        # Bank 0: V POL Detector Output Monitor (ADC channel 8)
-        # Bank 1: H POL Detector Output Monitor (ADC channel 9)
+        # Bank 0: V POL Detector Output Monitor (LN0)
+        # Bank 1: H POL Detector Output Monitor (LN1)
         # Bank 2: Attenuator values
         # Bank -1: Firmware revision
         if bank == -1:
             return FIRMWARE_REV
         elif bank == 0:
-            # Return ADC reading for channel 8 (placeholder)
-            return 0
+            # Read LN0 (GP26) - 12-bit ADC, read_u16() returns 0-65535
+            # Scale to 12-bit (0-4095) to match original behavior
+            raw_value = self.adc_ln0.read_u16()
+            # Convert 16-bit reading (0-65535) to 12-bit value (0-4095)
+            adc_value = (raw_value * 4095) // 65535
+            voltage = (raw_value / 65535.0) * 3.3
+            print(f"[ADC] LN0 (GP26): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
+            return adc_value
         elif bank == 1:
-            # Return ADC reading for channel 9 (placeholder)
-            return 0
+            # Read LN1 (GP27) - 12-bit ADC, read_u16() returns 0-65535
+            # Scale to 12-bit (0-4095) to match original behavior
+            raw_value = self.adc_ln1.read_u16()
+            # Convert 16-bit reading (0-65535) to 12-bit value (0-4095)
+            adc_value = (raw_value * 4095) // 65535
+            voltage = (raw_value / 65535.0) * 3.3
+            print(f"[ADC] LN1 (GP27): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
+            return adc_value
         elif bank == 2:
             # Return attenuator values
             return self.atten_state
