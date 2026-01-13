@@ -16,7 +16,7 @@ import time
 
 # Constants
 BUFFER_LEN = 132
-FIRMWARE_REV = 6
+FIRMWARE_REV = 7
 MODBUS_BAUD = 1843200
 
 # Pin definitions
@@ -472,7 +472,8 @@ class DCMHardware:
             # Convert 16-bit reading (0-65535) to 12-bit value (0-4095)
             adc_value = (raw_value * 4095) // 65535
             voltage = (raw_value / 65535.0) * 3.3
-            print(f"[ADC] LN0 (GP26): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
+            if DEBUG_ENV:
+                print(f"[ADC] LN0 (GP26): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
             return adc_value
         elif bank == 1:
             # Read LN1 (GP27) - 12-bit ADC, read_u16() returns 0-65535
@@ -481,7 +482,8 @@ class DCMHardware:
             # Convert 16-bit reading (0-65535) to 12-bit value (0-4095)
             adc_value = (raw_value * 4095) // 65535
             voltage = (raw_value / 65535.0) * 3.3
-            print(f"[ADC] LN1 (GP27): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
+            if DEBUG_ENV:
+                print(f"[ADC] LN1 (GP27): raw={raw_value:5d}, 12-bit={adc_value:4d}, voltage={voltage:.3f}V")
             return adc_value
         elif bank == 2:
             # Return attenuator values
@@ -887,6 +889,10 @@ class DCM:
         # Frame detection parameters (matching picoMODBUStest.py)
         # At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
         self.INTER_FRAME_US = 120
+        
+        # Maximum buffer sizes to prevent memory exhaustion
+        self.MAX_RX_BUF_SIZE = 1024  # Maximum RX buffer size (bytes)
+        self.MAX_FRAME_QUEUE_SIZE = 50  # Maximum frames in queue
     
     def modbus_serial_rx(self):
         """
@@ -900,9 +906,17 @@ class DCM:
         if n > 0:
             data = self.hw.modbus_uart.read(min(n, 512))
             if data:
-                self._rx_buf.extend(data)
-                self._collecting = True
-                self._last_rx_us = now
+                # Prevent RX buffer from growing too large
+                if len(self._rx_buf) + len(data) > self.MAX_RX_BUF_SIZE:
+                    # Buffer overflow - reset buffer to prevent memory exhaustion
+                    if DEBUG_ENV:
+                        print(f"[RX] Buffer overflow: {len(self._rx_buf)} bytes, resetting")
+                    self._rx_buf = bytearray()
+                    self._collecting = False
+                else:
+                    self._rx_buf.extend(data)
+                    self._collecting = True
+                    self._last_rx_us = now
         
         if self._collecting:
             idle = time.ticks_diff(now, self._last_rx_us)
@@ -930,6 +944,12 @@ class DCM:
                 for raw_msg in frames:
                     payload = raw_msg[:-2]  # Remove CRC
                     if check_crc(raw_msg):
+                        # Prevent frame queue from growing too large
+                        if len(self._frame_queue) >= self.MAX_FRAME_QUEUE_SIZE:
+                            # Queue overflow - drop oldest frame
+                            dropped = self._frame_queue.pop(0)
+                            if DEBUG_ENV:
+                                print(f"[RX] Frame queue overflow: dropped frame")
                         self._frame_queue.append(payload)
                         if DEBUG_ENV:
                             addr = payload[0] if len(payload) > 0 else 0
@@ -990,74 +1010,101 @@ class DCM:
     
     def tick(self):
         """Main MODBUS tick function - call periodically"""
-        # Receive message
-        rx_data = self.modbus_serial_rx()
-        
-        if rx_data == 0:
-            return  # No data
-        elif rx_data == MB_CRC_ERROR:
-            if DEBUG_ENV and PRINT_TICK:
-                if not PRINT_MY_ADDRESS_ONLY:
-                    print("[TICK] CRC error - ignoring frame")
-                else:
-                    pass
-            return  # CRC error, ignore
-        
-        if len(rx_data) < 2:
-            if DEBUG_ENV and PRINT_TICK:
-                if not PRINT_MY_ADDRESS_ONLY:
-                    print(f"[TICK] Frame too short: {len(rx_data)} bytes")
-                else:
-                    pass
-            return
-        
-        addr = rx_data[0]
-        func = rx_data[1]
-        
-        if DEBUG_ENV:
-            if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
-                pass
-            else:
-                decoded = self._decoder.decode(rx_data, has_crc=False)
-                if PRINT_TICK:
-                    print(f"[TICK] Processing: {decoded}")
-        
-        # Check if message is for this device
-        if addr == self.hw.mb_address:
-            # Execute command
-            reply = self.modbus.execute(rx_data)
-            if reply:
+        try:
+            # Receive message
+            rx_data = self.modbus_serial_rx()
+            
+            if rx_data == 0:
+                return  # No data
+            elif rx_data == MB_CRC_ERROR:
                 if DEBUG_ENV and PRINT_TICK:
-                    print(f"[TICK] Command executed, sending reply")
-                self.modbus_serial_tx(reply)
+                    if not PRINT_MY_ADDRESS_ONLY:
+                        print("[TICK] CRC error - ignoring frame")
+                    else:
+                        pass
+                return  # CRC error, ignore
+            
+            if len(rx_data) < 2:
+                if DEBUG_ENV and PRINT_TICK:
+                    if not PRINT_MY_ADDRESS_ONLY:
+                        print(f"[TICK] Frame too short: {len(rx_data)} bytes")
+                    else:
+                        pass
+                return
+            
+            addr = rx_data[0]
+            func = rx_data[1]
+            
+            if DEBUG_ENV:
+                if PRINT_MY_ADDRESS_ONLY and addr != self.hw.mb_address:
+                    pass
+                else:
+                    decoded = self._decoder.decode(rx_data, has_crc=False)
+                    if PRINT_TICK:
+                        print(f"[TICK] Processing: {decoded}")
+            
+            # Check if message is for this device
+            if addr == self.hw.mb_address:
+                # Execute command
+                reply = self.modbus.execute(rx_data)
+                if reply:
+                    if DEBUG_ENV and PRINT_TICK:
+                        print(f"[TICK] Command executed, sending reply")
+                    self.modbus_serial_tx(reply)
+                else:
+                    if DEBUG_ENV and PRINT_TICK:
+                        print(f"[TICK] Command executed, no reply")
+            elif addr == 0 and func == 0x45:  # Event trigger (0x45 = 69 decimal = 'E')
+                if DEBUG_ENV and PRINT_TICK:
+                    decoded = self._decoder.decode(rx_data, has_crc=False)
+                    print(f"[TICK] Event trigger: {decoded}")
+                self.hw.event_trigger()
+            elif addr == 0 and func in [0x44, 0x43]:  # Broadcast commands (0x44=68='D', 0x43=67='C')
+                if DEBUG_ENV and PRINT_TICK:
+                    decoded = self._decoder.decode(rx_data, has_crc=False)
+                    print(f"[TICK] Broadcast command: {decoded}")
+                # Execute broadcast command but don't send reply
+                self.modbus.execute(rx_data)
             else:
                 if DEBUG_ENV and PRINT_TICK:
-                    print(f"[TICK] Command executed, no reply")
-        elif addr == 0 and func == 0x45:  # Event trigger (0x45 = 69 decimal = 'E')
-            if DEBUG_ENV and PRINT_TICK:
-                decoded = self._decoder.decode(rx_data, has_crc=False)
-                print(f"[TICK] Event trigger: {decoded}")
-            self.hw.event_trigger()
-        elif addr == 0 and func in [0x44, 0x43]:  # Broadcast commands (0x44=68='D', 0x43=67='C')
-            if DEBUG_ENV and PRINT_TICK:
-                decoded = self._decoder.decode(rx_data, has_crc=False)
-                print(f"[TICK] Broadcast command: {decoded}")
-            # Execute broadcast command but don't send reply
-            self.modbus.execute(rx_data)
-        else:
-            if DEBUG_ENV and PRINT_TICK:
-                decoded = self._decoder.decode(rx_data, has_crc=False)
-                print(f"[TICK] Address mismatch: {decoded}")
+                    decoded = self._decoder.decode(rx_data, has_crc=False)
+                    print(f"[TICK] Address mismatch: {decoded}")
+        except Exception as e:
+            # Catch exceptions to prevent crash, but print error for debugging
+            if DEBUG_ENV:
+                print(f"[TICK] Exception: {e}")
+            # Reset RX state on error to prevent stuck state
+            self._rx_buf = bytearray()
+            self._collecting = False
+            import sys
+            sys.print_exception(e)
 
 
 def main():
     """Main program loop"""
     # Initialize DCM
-    dcm = DCM()
+    try:
+        dcm = DCM()
+    except Exception as e:
+        print(f"Failed to initialize DCM: {e}")
+        import sys
+        sys.print_exception(e)
+        return
     
-    # Main loop
+    # Main loop with exception handling
     while True:
-        dcm.tick()
+        try:
+            dcm.tick()
+        except KeyboardInterrupt:
+            print("\nStopped by user")
+            break
+        except Exception as e:
+            # Catch unexpected exceptions to keep running
+            if DEBUG_ENV:
+                print(f"[MAIN] Exception in tick: {e}")
+            import sys
+            sys.print_exception(e)
+
         #time.sleep_ms(1)  # Small delay to prevent tight loop
 
 
