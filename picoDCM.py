@@ -51,7 +51,7 @@ ADC_LN1_PIN = 27  # GP27 - LN1 detector output
 ADC_A2_PIN = 28   # GP28 - A2 ADC input
 
 # Debug flag - diagnostics print when DEBUG_ENV=False (inverted logic for production diagnostics)
-DEBUG_ENV = True  # Set to True to suppress diagnostics, False to print them
+DEBUG_ENV = False  # Set to True to suppress diagnostics, False to print them
 PRINT_MY_ADDRESS_ONLY = True  # Set to True to print only my address, False to print all messages
 PRINT_TICK = False  # Set to True to print tick messages, False to print only my address
 
@@ -365,7 +365,8 @@ class DCMHardware:
             dig_in_pin: Pin for digital input (default None)
         """
         # MODBUS UART and RS-485 control (8E1: 8 bits, EVEN parity, 1 stop bit)
-        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(MODBUS_TX_PIN), rx=Pin(MODBUS_RX_PIN), bits=8, parity=0, stop=1)
+        self.modbus_uart = UART(modbus_uart_id, MODBUS_BAUD, tx=Pin(MODBUS_TX_PIN), 
+            rx=Pin(MODBUS_RX_PIN), bits=8, parity=0, stop=1)
         if modbus_de_pin is None:
             self.de_pin = Pin(MODBUS_DE_PIN, Pin.OUT)  # GP2 - RS-485 DE/RE control
         else:
@@ -680,14 +681,48 @@ class ModbusSlave:
         
         return MB_SUCCESS
     
+    def _validate_write_bank_and_value(self, bank, value):
+        """
+        Validate write register and value according to Rabbit C semantics.
+        Returns error code if invalid, None if valid.
+        Rabbit C: OutRegNbr > 52 => MB_BADADDR
+                  For bank 0 and banks 3..52: both bytes must be <= 0x0F else MB_BADDATA
+        """
+        # Range check (Rabbit: OutRegNbr > 52 => MB_BADADDR)
+        if bank < 0 or bank > 52:
+            return MB_BADADDR
+        
+        lo = value & 0xFF
+        hi = (value >> 8) & 0xFF
+        
+        # Nibble-only validation for atten set (bank 0) and table entries (banks 3..52)
+        if bank == 0 or (3 <= bank <= 52):
+            if lo > 0x0F or hi > 0x0F:
+                return MB_BADDATA
+        
+        # Optional safety: enforce table index bounds (bank 2) to prevent IndexError
+        if bank == 2:
+            idx = lo & 0xFF
+            if idx > 49:
+                return MB_BADDATA
+        
+        return None
+    
     def _write_reg(self):
         """Write single register (function 0x06)"""
         reg_nbr = self._cmd_word(2)
         reg_val = self._cmd_word(4)
         
+        # Validate before applying (Rabbit validates before digOutBank)
+        err = self._validate_write_bank_and_value(reg_nbr, reg_val)
+        if err is not None:
+            return err
+        
+        # Reply with register number and value (MODBUS standard)
         self._reply_word(reg_nbr)
         self._reply_word(reg_val)
         
+        # Apply the write
         self.hw.dig_out_bank(reg_nbr, reg_val)
         return MB_SUCCESS
     
@@ -716,21 +751,35 @@ class ModbusSlave:
     
     def _write_regs(self):
         """Write multiple registers (function 0x10)"""
-        reg_nbr = self._cmd_word(2)
+        start_reg_nbr = self._cmd_word(2)
         reg_cnt = self._cmd_word(4)
         
-        self._reply_word(reg_nbr)
-        self._reply_word(reg_cnt)
-        
+        # Validate all registers first (Rabbit validates before applying)
         data_idx = 7
+        reg_vals = []
+        reg_nbr = start_reg_nbr
         for _ in range(reg_cnt):
             if data_idx + 1 < len(self.cmd_buffer):
                 reg_val = (self.cmd_buffer[data_idx] << 8) | self.cmd_buffer[data_idx + 1]
-                self.hw.dig_out_bank(reg_nbr, reg_val)
+                reg_vals.append((reg_nbr, reg_val))
                 reg_nbr += 1
                 data_idx += 2
             else:
                 return MB_BADDATA
+        
+        # Validate each register
+        for bank, val in reg_vals:
+            err = self._validate_write_bank_and_value(bank, val)
+            if err is not None:
+                return err
+        
+        # Reply with start register and count (MODBUS standard)
+        self._reply_word(start_reg_nbr)
+        self._reply_word(reg_cnt)
+        
+        # Apply all writes after validation passes
+        for bank, val in reg_vals:
+            self.hw.dig_out_bank(bank, val)
         
         return MB_SUCCESS
     
@@ -740,16 +789,24 @@ class ModbusSlave:
         and_mask = self._cmd_word(4)
         or_mask = self._cmd_word(6)
         
+        # Read current value
+        curr_val_ref = [0]
+        err = self.mbs_reg_out_rd(reg_nbr, curr_val_ref)
+        if err != MB_SUCCESS:
+            return err
+        curr_val = curr_val_ref[0]
+        
+        new_val = (curr_val & and_mask) | (or_mask & ~and_mask)
+        
+        # Validate the resulting value before applying
+        err = self._validate_write_bank_and_value(reg_nbr, new_val)
+        if err is not None:
+            return err
+        
         self._reply_word(reg_nbr)
         self._reply_word(and_mask)
         self._reply_word(or_mask)
         
-        # Read current value
-        curr_val_ref = [0]
-        self.mbs_reg_out_rd(reg_nbr, curr_val_ref)
-        curr_val = curr_val_ref[0]
-        
-        new_val = (curr_val & and_mask) | (or_mask & ~and_mask)
         self.hw.dig_out_bank(reg_nbr, new_val)
         return MB_SUCCESS
     
@@ -763,15 +820,27 @@ class ModbusSlave:
         else:
             return MB_BADDATA
         
+        # Collect all write values first for validation
         data_idx = 11
+        write_vals = []
         for _ in range(write_reg_cnt):
             if data_idx + 1 < len(self.cmd_buffer):
                 reg_val = (self.cmd_buffer[data_idx] << 8) | self.cmd_buffer[data_idx + 1]
-                self.hw.dig_out_bank(write_reg_nbr, reg_val)
+                write_vals.append((write_reg_nbr, reg_val))
                 write_reg_nbr += 1
                 data_idx += 2
             else:
                 return MB_BADDATA
+        
+        # Validate all writes before applying
+        for bank, val in write_vals:
+            err = self._validate_write_bank_and_value(bank, val)
+            if err is not None:
+                return err
+        
+        # Apply all writes after validation passes
+        for bank, val in write_vals:
+            self.hw.dig_out_bank(bank, val)
         
         # Then read registers
         read_reg_nbr = self._cmd_word(2)
@@ -988,7 +1057,7 @@ class DCM:
 
         # Enable driver
         self.hw.de_pin.value(1)
-        time.sleep_us(50)  # allow transceiver to enable
+        time.sleep_us(10)  # allow transceiver to enable
 
         # Write bytes
         self.hw.modbus_uart.write(tx_data)
@@ -996,21 +1065,12 @@ class DCM:
         # Conservative hold time: assume 11 bits/byte for 8E1
         bits_per_byte = 11
         tx_time_us = int(len(tx_data) * bits_per_byte * 1_000_000 / MODBUS_BAUD)
-        time.sleep_us(tx_time_us + 80)  # extra margin
+        time.sleep_us(tx_time_us + 50)  # extra margin
 
-        # Optional: still wait on txdone if supported
-        try:
-            while not self.hw.modbus_uart.txdone():
-                time.sleep_us(10)
-        except AttributeError:
-            pass
-
-        time.sleep_us(50)  # tail margin
         self.hw.de_pin.value(0)
     
     def tick(self):
         """Main MODBUS tick function - call periodically"""
-        try:
             # Receive message
             rx_data = self.modbus_serial_rx()
             
@@ -1069,15 +1129,6 @@ class DCM:
                 if DEBUG_ENV and PRINT_TICK:
                     decoded = self._decoder.decode(rx_data, has_crc=False)
                     print(f"[TICK] Address mismatch: {decoded}")
-        except Exception as e:
-            # Catch exceptions to prevent crash, but print error for debugging
-            if DEBUG_ENV:
-                print(f"[TICK] Exception: {e}")
-            # Reset RX state on error to prevent stuck state
-            self._rx_buf = bytearray()
-            self._collecting = False
-            import sys
-            sys.print_exception(e)
 
 
 def main():
@@ -1093,17 +1144,7 @@ def main():
     
     # Main loop with exception handling
     while True:
-        try:
-            dcm.tick()
-        except KeyboardInterrupt:
-            print("\nStopped by user")
-            break
-        except Exception as e:
-            # Catch unexpected exceptions to keep running
-            if DEBUG_ENV:
-                print(f"[MAIN] Exception in tick: {e}")
-            import sys
-            sys.print_exception(e)
+        dcm.tick()
 
         #time.sleep_ms(1)  # Small delay to prevent tight loop
 
