@@ -134,6 +134,9 @@ def check_crc(frame: bytes) -> bool:
         return False
     rx_crc = frame[-2] | (frame[-1] << 8)  # LSB then MSB on the wire
     calc_crc = crc16_modbus(frame[:-2])
+
+    #rx_crc = (frame[-2] << 8) | frame[-1]  # MSB then LSB on the wire
+    #calc_crc = crc16_modbus(frame[:-2])
     return rx_crc == calc_crc
 
 
@@ -753,6 +756,8 @@ class ModbusSlave:
         """Write multiple registers (function 0x10)"""
         start_reg_nbr = self._cmd_word(2)
         reg_cnt = self._cmd_word(4)
+
+        print(f"[WRITE_REGS] start_reg_nbr={start_reg_nbr}, reg_cnt={reg_cnt}")
         
         # Validate all registers first (Rabbit validates before applying)
         data_idx = 7
@@ -1072,6 +1077,7 @@ class DCM:
     def tick(self):
         """Main MODBUS tick function - call periodically"""
             # Receive message
+        if True:
             rx_data = self.modbus_serial_rx()
             
             if rx_data == 0:
