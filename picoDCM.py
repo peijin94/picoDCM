@@ -109,18 +109,16 @@ MODBUS_CRC_LSB = bytes([
 
 def crc16_modbus(data: bytes) -> int:
     """
-    Calculate MODBUS CRC16 using standard polynomial 0xA001.
-    Returns CRC16 value. CRC is appended LSB first, then MSB on the wire.
+    Calculate MODBUS CRC16 using lookup tables (matches Rabbit C MODBUS_CRC function).
+    Returns CRC16 value. CRC is appended MSB first, then LSB on the wire.
     """
-    crc = 0xFFFF
+    c_hi = 0xFF
+    c_lo = 0xFF
     for b in data:
-        crc ^= b
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
-    return crc & 0xFFFF
+        w = c_hi ^ b
+        c_hi = c_lo ^ MODBUS_CRC_MSB[w]
+        c_lo = MODBUS_CRC_LSB[w]
+    return ((c_hi << 8) | c_lo) & 0xFFFF
 
 
 def modbus_crc(data):
@@ -132,11 +130,8 @@ def check_crc(frame: bytes) -> bool:
     """Check if frame has valid CRC"""
     if len(frame) < 4:
         return False
-    rx_crc = frame[-2] | (frame[-1] << 8)  # LSB then MSB on the wire
+    rx_crc = (frame[-2] << 8) | frame[-1]  # MSB then LSB on the wire
     calc_crc = crc16_modbus(frame[:-2])
-
-    #rx_crc = (frame[-2] << 8) | frame[-1]  # MSB then LSB on the wire
-    #calc_crc = crc16_modbus(frame[:-2])
     return rx_crc == calc_crc
 
 
@@ -232,6 +227,7 @@ class DCMDecoder:
         # 0x10 Write Multiple Registers
         if func == 0x10:
             # response payload 4 bytes: start, qty
+            print(f"[WRM_RESP] payload={hex_bytes(payload)}")
             if len(payload) == 4:
                 start = u16_be(payload[0], payload[1])
                 qty = u16_be(payload[2], payload[3])
@@ -522,7 +518,9 @@ class DCMHardware:
                 self.atten_offset = byte_high
         elif 3 <= bank < 53:
             # Set attenuator table entry
-            self.atten_table[bank - 3] = ((byte_high << 4) | (byte_low & 0x0F)) & 0xFF
+            table_index = bank - 3
+            table_value = ((byte_high << 4) | (byte_low & 0x0F)) & 0xFF
+            self.atten_table[table_index] = table_value
     
     def rd_holding_reg(self, address):
         """Read holding register"""
@@ -581,6 +579,7 @@ class ModbusSlave:
     def __init__(self, hardware):
         self.hw = hardware
         self.cmd_buffer = bytearray(256)
+        self.cmd_len = 0  # Actual length of command data
         self.reply_buffer = bytearray(256)
         self.reply_ptr = 0
     
@@ -614,7 +613,7 @@ class ModbusSlave:
     
     def _cmd_word(self, offset):
         """Extract word (MSB first) from command"""
-        if offset + 1 < len(self.cmd_buffer):
+        if offset + 1 < self.cmd_len:
             return (self.cmd_buffer[offset] << 8) | self.cmd_buffer[offset + 1]
         return 0
     
@@ -731,9 +730,22 @@ class ModbusSlave:
     
     def _force_coils(self):
         """Write multiple coils (function 0x0F)"""
+        # Validate minimum frame length: 7 bytes (addr+func+start+qty+byteCount)
+        if self.cmd_len < 7:
+            return MB_BADDATA
+        
         coil_nbr = self._cmd_word(2)
         coil_cnt = self._cmd_word(4)
         byte_cnt = self.cmd_buffer[6]
+        
+        # Validate byteCount: should be ceil(coil_cnt / 8)
+        expected_byte_cnt = (coil_cnt + 7) // 8
+        if byte_cnt != expected_byte_cnt:
+            return MB_BADDATA
+        
+        # Validate total frame length: 7 + byteCount
+        if self.cmd_len < 7 + byte_cnt:
+            return MB_BADDATA
         
         self._reply_word(coil_nbr)
         self._reply_word(coil_cnt)
@@ -754,17 +766,29 @@ class ModbusSlave:
     
     def _write_regs(self):
         """Write multiple registers (function 0x10)"""
+        # Validate minimum frame length: 7 bytes (addr+func+start+qty+byteCount)
+        if self.cmd_len < 7:
+            return MB_BADDATA
+        
         start_reg_nbr = self._cmd_word(2)
         reg_cnt = self._cmd_word(4)
-
-        print(f"[WRITE_REGS] start_reg_nbr={start_reg_nbr}, reg_cnt={reg_cnt}")
+        byte_cnt = self.cmd_buffer[6]
+        
+        # Validate byteCount: must equal 2 * reg_cnt (each register is 2 bytes)
+        expected_byte_cnt = 2 * reg_cnt
+        if byte_cnt != expected_byte_cnt:
+            return MB_BADDATA
+        
+        # Validate total frame length: 7 + byteCount
+        if self.cmd_len < 7 + byte_cnt:
+            return MB_BADDATA
         
         # Validate all registers first (Rabbit validates before applying)
         data_idx = 7
         reg_vals = []
         reg_nbr = start_reg_nbr
         for _ in range(reg_cnt):
-            if data_idx + 1 < len(self.cmd_buffer):
+            if data_idx + 1 < self.cmd_len:
                 reg_val = (self.cmd_buffer[data_idx] << 8) | self.cmd_buffer[data_idx + 1]
                 reg_vals.append((reg_nbr, reg_val))
                 reg_nbr += 1
@@ -817,19 +841,29 @@ class ModbusSlave:
     
     def _reg_rd_wr(self):
         """Read/write multiple registers (function 0x17)"""
+        # Validate minimum frame length: 11 bytes (addr+func+readStart+readQty+writeStart+writeQty+byteCount)
+        if self.cmd_len < 11:
+            return MB_BADDATA
+        
         # Write registers first
         write_reg_nbr = self._cmd_word(6)
         write_reg_cnt = self._cmd_word(8)
-        if 10 < len(self.cmd_buffer):
-            byte_cnt = self.cmd_buffer[10]
-        else:
+        byte_cnt = self.cmd_buffer[10]
+        
+        # Validate byteCount: must equal 2 * write_reg_cnt (each register is 2 bytes)
+        expected_byte_cnt = 2 * write_reg_cnt
+        if byte_cnt != expected_byte_cnt:
+            return MB_BADDATA
+        
+        # Validate total frame length: 11 + byteCount
+        if self.cmd_len < 11 + byte_cnt:
             return MB_BADDATA
         
         # Collect all write values first for validation
         data_idx = 11
         write_vals = []
         for _ in range(write_reg_cnt):
-            if data_idx + 1 < len(self.cmd_buffer):
+            if data_idx + 1 < self.cmd_len:
                 reg_val = (self.cmd_buffer[data_idx] << 8) | self.cmd_buffer[data_idx + 1]
                 write_vals.append((write_reg_nbr, reg_val))
                 write_reg_nbr += 1
@@ -893,7 +927,8 @@ class ModbusSlave:
             return None
         
         # Copy command to buffer
-        self.cmd_buffer[:len(cmd_data)] = cmd_data
+        self.cmd_len = len(cmd_data)
+        self.cmd_buffer[:self.cmd_len] = cmd_data
         
         cmd = self.cmd_buffer[1]
         self._reply_init(cmd)
@@ -965,8 +1000,8 @@ class DCM:
         self.INTER_FRAME_US = 120
         
         # Maximum buffer sizes to prevent memory exhaustion
-        self.MAX_RX_BUF_SIZE = 1024  # Maximum RX buffer size (bytes)
-        self.MAX_FRAME_QUEUE_SIZE = 50  # Maximum frames in queue
+        self.MAX_RX_BUF_SIZE = 4096  # Maximum RX buffer size (bytes)
+        self.MAX_FRAME_QUEUE_SIZE = 100  # Maximum frames in queue
     
     def modbus_serial_rx(self):
         """
@@ -1057,8 +1092,8 @@ class DCM:
 
         crc = crc16_modbus(data)
         tx_data = bytearray(data)
-        tx_data.append(crc & 0xFF)          # LSB
-        tx_data.append((crc >> 8) & 0xFF)   # MSB
+        tx_data.append((crc >> 8) & 0xFF)   # MSB (sent first)
+        tx_data.append(crc & 0xFF)          # LSB (sent second)
 
         # Enable driver
         self.hw.de_pin.value(1)
