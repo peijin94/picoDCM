@@ -42,8 +42,8 @@ PA6_PIN = 16  # GP16
 PA7_PIN = 17  # GP17
 ATTEN_PINS = list(range(10, 18))  # GP10-GP17
 
-# Digital input pin
-DIG_IN_PIN = 3  # GP3 - LO2_LOCK monitor (same as AD0, check hardware design)
+# Digital input pin - DEACTIVATED per user request.
+# DIG_IN_PIN = 3  # GP3 - LO2_LOCK monitor (same as AD0, check hardware design)
 
 # ADC input pins
 ADC_LN0_PIN = 26  # GP26 - LN0 detector output
@@ -422,9 +422,9 @@ class DCMHardware:
             self.atten_pins = [Pin(p, Pin.OUT) for p in atten_pins]
         
         # Digital input (PC3 equivalent for LO2_LOCK monitor)
-        # Note: DIG_IN_PIN uses GP3 which is same as AD0_PIN - check hardware design
+        # Note: DIG_IN_PIN is deactivated.
         if dig_in_pin is None:
-            self.dig_in_pin = Pin(DIG_IN_PIN, Pin.IN, Pin.PULL_DOWN)
+            self.dig_in_pin = None # Deactivated
         else:
             self.dig_in_pin = Pin(dig_in_pin, Pin.IN, Pin.PULL_DOWN)
         
@@ -453,6 +453,8 @@ class DCMHardware:
     
     def dig_in(self, channel):
         """Read digital input channel (0 = LO2_LOCK monitor)"""
+        if self.dig_in_pin is None:
+            return 0  # Pin deactivated
         if channel == 0:
             return 1 if self.dig_in_pin.value() else 0
         return 0

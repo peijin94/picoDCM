@@ -16,7 +16,7 @@ This copies `picoDCM.py` to the Pico as `main.py`, which will run automatically 
 
 This module implements a MODBUS RTU slave for the EOVSA Downconverter Module (DCM) with support for:
 - MODBUS RTU over RS-485 (1843200 baud, 8E1)
-- Digital I/O control
+- Digital I/O control (DIG_IN_PIN deactivated)
 - Analog inputs (ADC)
 - Attenuator control (normal and table modes)
 - Event-driven table selection
@@ -123,7 +123,7 @@ MAX_ACCUM_US = 8000  # Maximum accumulated time (microseconds)
 GP0  - TX_E (MODBUS UART TX)
 GP1  - RX_E (MODBUS UART RX)
 GP2  - DRV_EN (RS-485 DE/RE control)
-GP3  - AD0 (Address bit 0)
+GP3  - AD0 (Address bit 0, DIG_IN_PIN deactivated)
 GP4  - AD1 (Address bit 1)
 GP5  - AD2 (Address bit 2)
 GP6  - AD3 (Address bit 3)
