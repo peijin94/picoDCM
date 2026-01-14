@@ -985,23 +985,26 @@ class DCM:
                              **kwargs)
         self.modbus = ModbusSlave(self.hw)
         
+        # Frame detection parameters (matching picoMODBUStest.py)
+        # At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
+        self.INTER_FRAME_US = 30
+        
+        # Maximum buffer sizes to prevent memory exhaustion
+        self.MAX_RX_BUF_SIZE = 4096  # Maximum RX buffer size (bytes)
+        self.MAX_FRAME_QUEUE_SIZE = 100  # Maximum frames in queue
+        self.TX_DELAY_US = 15  # Delay after enabling transceiver (us)
+        self.MAX_ACCUM_US = 8000  # Maximum accumulated time (us)
+        
         # Frame splitting for receiving concatenated frames
         self._frame_splitter = ModbusFrameSplitter()
-        self._rx_buf = bytearray()
+        self._rx_buf = bytearray(self.MAX_RX_BUF_SIZE)  # Preallocated buffer
+        self._rx_buf_len = 0  # Actual length of data in buffer
         self._frame_queue = []  # Queue for multiple frames received in one chunk
         self._collecting = False
         self._last_rx_us = 0
         
         # Decoder for formatted output
         self._decoder = DCMDecoder()
-        
-        # Frame detection parameters (matching picoMODBUStest.py)
-        # At 1843200 baud: 3.5 character times ≈ 19 µs, use 120 µs to be safe
-        self.INTER_FRAME_US = 120
-        
-        # Maximum buffer sizes to prevent memory exhaustion
-        self.MAX_RX_BUF_SIZE = 4096  # Maximum RX buffer size (bytes)
-        self.MAX_FRAME_QUEUE_SIZE = 100  # Maximum frames in queue
     
     def modbus_serial_rx(self):
         """
@@ -1015,15 +1018,18 @@ class DCM:
         if n > 0:
             data = self.hw.modbus_uart.read(min(n, 512))
             if data:
+                data_len = len(data)
                 # Prevent RX buffer from growing too large
-                if len(self._rx_buf) + len(data) > self.MAX_RX_BUF_SIZE:
+                if self._rx_buf_len + data_len > self.MAX_RX_BUF_SIZE:
                     # Buffer overflow - reset buffer to prevent memory exhaustion
                     if DEBUG_ENV:
-                        print(f"[RX] Buffer overflow: {len(self._rx_buf)} bytes, resetting")
-                    self._rx_buf = bytearray()
+                        print(f"[RX] Buffer overflow: {self._rx_buf_len} bytes, resetting")
+                    self._rx_buf_len = 0
                     self._collecting = False
                 else:
-                    self._rx_buf.extend(data)
+                    # Copy data into preallocated buffer
+                    self._rx_buf[self._rx_buf_len:self._rx_buf_len + data_len] = data
+                    self._rx_buf_len += data_len
                     self._collecting = True
                     self._last_rx_us = now
         
@@ -1031,15 +1037,17 @@ class DCM:
             idle = time.ticks_diff(now, self._last_rx_us)
             if idle >= self.INTER_FRAME_US:
                 # Frame group complete - split into individual frames
-                chunk = bytes(self._rx_buf)
-                self._rx_buf = bytearray()
+                chunk = bytes(self._rx_buf[:self._rx_buf_len])
+                self._rx_buf_len = 0
                 self._collecting = False
                 
                 frames, leftover = self._frame_splitter.split(chunk)
                 
                 # Keep leftover (partial frame) for next round
                 if leftover:
-                    self._rx_buf.extend(leftover)
+                    leftover_len = len(leftover)
+                    self._rx_buf[0:leftover_len] = leftover
+                    self._rx_buf_len = leftover_len
                     self._collecting = True
                     self._last_rx_us = time.ticks_us()
                 
